@@ -1,0 +1,56 @@
+# Fly.io config — adjust app name and region before first deploy.
+# Run: fly launch --no-deploy --copy-config
+#      fly volume create poly5m_data --size 1 --region ams
+#      fly secrets set POLY_PRIVATE_KEY=0x... POLY_FUNDER=0x...
+#      fly deploy
+
+app = "poly5m-bot"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  COINS = "btc,eth,xrp,doge,hype,bnb,sol"
+  ENTRY_THRESHOLD = "0.58"
+  ENTRY_MAX_PRICE = "0.97"
+  POSITION_SIZE_USD = "1.0"
+  MIN_SECONDS_REMAINING = "20"
+
+  MAX_CONCURRENT_POSITIONS = "20"
+  MAX_DAILY_LOSS_USD = "50.0"
+  KILL_SWITCH = "false"
+
+  DRY_RUN = "true"
+  TRADING_ENABLED = "false"
+  ARMED_FOR_LIVE = "false"
+
+  POLY_SIGNATURE_TYPE = "2"
+  POLY_AUTO_DERIVE_CREDS = "true"
+
+  DB_PATH = "/data/bot.sqlite3"
+  HEALTHCHECK_PORT = "8080"
+  LOG_LEVEL = "INFO"
+
+[mounts]
+  source = "poly5m_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
