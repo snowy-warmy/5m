@@ -831,27 +831,29 @@ class Bot:
         self.start_time = time.time()
 
     async def discovery_loop(self) -> None:
-        """Schedule-based discovery: sleep until next 5-minute boundary,
-        then poll fast (every 50ms) until we get the new window or 3s elapse.
-        Falls back to slow polling for catching up after restart."""
-        # Initial catch-up: discover whatever's currently active
-        await self._discover_current()
+        """Sleep until each 5-min boundary + 100ms, then place orders.
+        Skip the currently-in-progress window on startup — only trade fresh
+        windows where we can catch market open."""
+        log.info("discovery: waiting for next 5-min boundary")
 
         while True:
             try:
-                # Sleep until 100ms before the next 5-min boundary (safety buffer)
+                # Compute next boundary
                 now = time.time()
                 next_boundary = ((int(now) // 300) + 1) * 300
-                wait = next_boundary - now - 0.1
+                # Wake 100ms after boundary to give Gamma time to publish
+                wake_at = next_boundary + 0.1
+                wait = wake_at - now
                 if wait > 0:
                     await asyncio.sleep(wait)
 
-                # Expire windows past their end
-                window = current_window_ts()
-                expired_slugs = []
-                for s, m in list(self.markets.items()):
-                    if m.window_ts < window:
-                        expired_slugs.append(s)
+                window = next_boundary  # this is the slug timestamp
+                wake_actual = time.time()
+                debug.event(f"boundary tick: {window} (woke {(wake_actual-next_boundary)*1000:.0f}ms after open)")
+
+                # Expire any old markets
+                expired_slugs = [s for s, m in list(self.markets.items())
+                                 if m.window_ts < window]
                 for s in expired_slugs:
                     m = self.markets.pop(s, None)
                     if m:
@@ -859,52 +861,38 @@ class Bot:
                         self.books.pop(m.down_token_id, None)
                         self.token_lookup.pop(m.up_token_id, None)
                         self.token_lookup.pop(m.down_token_id, None)
-                        for side in ("UP", "DOWN"):
-                            for ri in range(len(ENTRY_THRESHOLDS)):
-                                self.triggered.discard((m.slug, side, ri))
-                                self.seen_below.discard((m.slug, side, ri))
-                if expired_slugs:
-                    debug.event(f"expired {len(expired_slugs)} window(s)")
 
-                # Fast polling until new window is found or 3s timeout
+                # Fetch all coins for this new window. Retry up to 3s.
                 deadline = time.time() + 3.0
+                pending_coins = list(COINS)
                 attempt = 0
-                while time.time() < deadline:
+                while pending_coins and time.time() < deadline:
                     attempt += 1
-                    missing = [(c, window) for c in COINS
-                               if f"{c}-updown-5m-{window}" not in self.markets]
-                    if not missing:
-                        break
                     results = await asyncio.gather(
-                        *(fetch_market(self.client, c, w) for c, w in missing)
+                        *(fetch_market(self.client, c, window) for c in pending_coins),
+                        return_exceptions=True,
                     )
-                    any_added = False
-                    for m in results:
-                        if m is not None and m.slug not in self.markets:
-                            await self._on_market_discovered(m, attempt=attempt)
-                            any_added = True
-                    if any_added:
-                        # Some discovered; loop again to catch the rest
-                        if all(f"{c}-updown-5m-{window}" in self.markets for c in COINS):
-                            break
-                    await asyncio.sleep(0.05)  # 50ms between retries
+                    next_pending = []
+                    for c, m in zip(pending_coins, results):
+                        if isinstance(m, Exception) or m is None:
+                            next_pending.append(c)
+                            continue
+                        if m.slug in self.markets:
+                            continue
+                        await self._on_market_discovered(m, attempt=attempt)
+                    pending_coins = next_pending
+                    if pending_coins:
+                        await asyncio.sleep(0.05)
 
-                if expired_slugs or any(f"{c}-updown-5m-{window}" in self.markets for c in COINS):
-                    self.subscription_changed.set()
+                if pending_coins:
+                    debug.event(f"timed out waiting for: {pending_coins}")
+
+                # Trigger WS resubscribe if anything changed
+                self.subscription_changed.set()
+
             except Exception as exc:
                 log.exception("discovery error: %s", exc)
                 await asyncio.sleep(1.0)
-
-    async def _discover_current(self) -> None:
-        """Initial catch-up — find whatever window is currently in progress."""
-        window = current_window_ts()
-        results = await asyncio.gather(
-            *(fetch_market(self.client, c, window) for c in COINS)
-        )
-        for m in results:
-            if m is not None and m.slug not in self.markets:
-                await self._on_market_discovered(m, attempt=0)
-        self.subscription_changed.set()
 
     async def _on_market_discovered(self, m: CryptoMarket, attempt: int) -> None:
         """Called once per new market. Registers it and (if STRATEGY=limits)
