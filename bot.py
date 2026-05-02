@@ -826,7 +826,7 @@ class LivePolymarketExecutor(BaseExecutor):
         options = PartialCreateOrderOptions(tick_size=order_tick, neg_risk=actual_neg_risk)
 
         response = None
-        for attempt in (1, 2):
+        for attempt in (1, 2, 3):
             try:
                 response = self.client.create_and_post_order(
                     order_args=args, options=options, order_type=OrderType.GTC,
@@ -834,14 +834,23 @@ class LivePolymarketExecutor(BaseExecutor):
                 break
             except Exception as exc:
                 msg = str(exc).lower()
-                if attempt == 1 and "invalid signature" in msg:
-                    log.warning("invalid signature on limit attempt 1 — re-deriving creds")
+                if attempt < 3 and "invalid signature" in msg:
+                    log.warning("invalid signature on limit attempt %d — re-deriving creds", attempt)
                     self.client = None
                     try:
                         self._ensure_client()
                         continue
                     except Exception as re_exc:
                         raise ExecutionError(f"limit_failed: re-derive: {re_exc}") from re_exc
+                # Cloudflare returns HTML on 400s when rate-limited. Retry.
+                if attempt < 3 and ("<html" in msg or "status_code=400" in msg
+                                    or "status_code=429" in msg
+                                    or "status_code=502" in msg
+                                    or "status_code=503" in msg):
+                    log.warning("limit attempt %d got rate-limit/CF, retrying in %.1fs",
+                                attempt, 0.3 * attempt)
+                    time.sleep(0.3 * attempt)
+                    continue
                 raise ExecutionError(f"limit_failed: {type(exc).__name__}: {exc}") from exc
 
         order_id = None
@@ -906,7 +915,7 @@ class LivePolymarketExecutor(BaseExecutor):
         options = PartialCreateOrderOptions(tick_size=order_tick, neg_risk=actual_neg_risk)
 
         response = None
-        for attempt in (1, 2):
+        for attempt in (1, 2, 3):
             try:
                 response = self.client.create_and_post_order(
                     order_args=args, options=options, order_type=OrderType.GTC,
@@ -914,13 +923,21 @@ class LivePolymarketExecutor(BaseExecutor):
                 break
             except Exception as exc:
                 msg = str(exc).lower()
-                if attempt == 1 and "invalid signature" in msg:
+                if attempt < 3 and "invalid signature" in msg:
                     self.client = None
                     try:
                         self._ensure_client()
                         continue
                     except Exception as re_exc:
                         raise ExecutionError(f"sell_failed: re-derive: {re_exc}") from re_exc
+                if attempt < 3 and ("<html" in msg or "status_code=400" in msg
+                                    or "status_code=429" in msg
+                                    or "status_code=502" in msg
+                                    or "status_code=503" in msg):
+                    log.warning("sell attempt %d got rate-limit/CF, retrying in %.1fs",
+                                attempt, 0.3 * attempt)
+                    time.sleep(0.3 * attempt)
+                    continue
                 raise ExecutionError(f"sell_failed: {type(exc).__name__}: {exc}") from exc
 
         order_id = None
@@ -1085,7 +1102,16 @@ class Bot:
                         *(t[2] for t in tasks), return_exceptions=True,
                     )
                     for (coin, window, _), m in zip(tasks, results):
-                        if isinstance(m, Exception) or m is None:
+                        secs_to_open = window - time.time()
+                        if isinstance(m, Exception):
+                            if iteration <= 5 or iteration % 20 == 0:
+                                log.info("fetch %s window=%d (opens in %+.0fs): exception %s",
+                                         coin, window, secs_to_open, m)
+                            continue
+                        if m is None:
+                            if iteration <= 5 or iteration % 20 == 0:
+                                log.info("fetch %s window=%d (opens in %+.0fs): not found",
+                                         coin, window, secs_to_open)
                             continue
                         if m.slug in self.markets_initialized:
                             continue
