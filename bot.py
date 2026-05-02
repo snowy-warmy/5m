@@ -513,9 +513,24 @@ class LivePolymarketExecutor(BaseExecutor):
             raise ExecutionError("live_mode_not_armed")
         token_id = market.up_token_id if side == "UP" else market.down_token_id
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, self._buy_sync, market, side, token_id, size_usd, ask_price,
-        )
+        # Use a dedicated executor with one worker per concurrent buy so we
+        # don't exhaust asyncio's default thread pool with hung HTTP calls.
+        if not hasattr(self, "_executor_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+            self._executor_pool = ThreadPoolExecutor(max_workers=16,
+                                                     thread_name_prefix="poly-buy")
+        # Hard timeout: SDK has no built-in timeouts, so we enforce one here.
+        # 25s = enough for 12s of fill polling + a few HTTP calls + slack.
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._executor_pool, self._buy_sync,
+                    market, side, token_id, size_usd, ask_price,
+                ),
+                timeout=25.0,
+            )
+        except asyncio.TimeoutError:
+            raise ExecutionError("buy_timeout (25s) — order may or may not have filled")
 
     def _buy_sync(self, market: CryptoMarket, side: str, token_id: str,
                   size_usd: float, ask_price: float) -> Position:
