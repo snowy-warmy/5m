@@ -1106,9 +1106,9 @@ class Bot:
                 await asyncio.sleep(5.0)
 
     async def _on_market_discovered(self, m: CryptoMarket, attempt: int) -> None:
-        """Called when a market is found via Gamma poll. Registers it and (if
-        STRATEGY=limits) places the BUY ladder. Idempotent: won't re-place if
-        the new_market WS event already handled this slug."""
+        """Called when a market is found via Gamma poll. Registers it.
+        Only places the BUY ladder for windows that haven't opened yet
+        (we don't want to trade a window that's already running)."""
         if m.slug in self.markets_initialized:
             return
         self.markets_initialized.add(m.slug)
@@ -1119,11 +1119,17 @@ class Bot:
         self.books[m.down_token_id] = TokenBook()
         self.token_lookup[m.up_token_id] = (m, "UP")
         self.token_lookup[m.down_token_id] = (m, "DOWN")
-        debug.event(f"discovered {m.slug} ({m.seconds_left()}s left, "
+        secs_until_open = m.window_ts - time.time()
+        debug.event(f"discovered {m.slug} (opens in {secs_until_open:+.1f}s, "
                     f"+{latency_ms:.0f}ms after open, source=gamma attempt {attempt})")
 
-        if STRATEGY == "limits":
+        # Only place orders for FUTURE windows (pre-market resting orders).
+        # Skip currently-running windows — by the time we'd place + cancel,
+        # the window is half over.
+        if STRATEGY == "limits" and secs_until_open > 0:
             await self._fire_buy_ladder(m, source="gamma")
+        elif STRATEGY == "limits":
+            debug.event(f"skip buy ladder {m.slug}: window already open ({secs_until_open:.0f}s ago)")
 
     async def _handle_new_market(self, msg: dict) -> None:
         """Handle a 'new_market' WS event — Polymarket pushes this the
@@ -1187,8 +1193,10 @@ class Bot:
             debug.event(f"NEW_MARKET ws-event {slug} ({secs_until_open:+.1f}s to open) "
                         f"— firing pre-market orders")
 
-            if STRATEGY == "limits":
+            if STRATEGY == "limits" and secs_until_open > 0:
                 await self._fire_buy_ladder(m, source="ws_new_market")
+            elif STRATEGY == "limits":
+                debug.event(f"skip buy ladder {slug}: window already open")
         except Exception as exc:
             log.exception("new_market handler error: %s", exc)
 
