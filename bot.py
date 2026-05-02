@@ -577,6 +577,11 @@ class LivePolymarketExecutor(BaseExecutor):
             api_key, api_secret, api_passphrase = POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE
 
         creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
+        # Stash creds on self so user_ws_loop can build its auth payload
+        # without depending on V2 SDK exposing them via client attributes.
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._api_passphrase = api_passphrase
         kwargs: dict[str, Any] = dict(
             host=POLYMARKET_HOST, chain_id=POLYMARKET_CHAIN_ID,
             key=POLY_PRIVATE_KEY, creds=creds,
@@ -941,7 +946,23 @@ class LivePolymarketExecutor(BaseExecutor):
     def _cancel_sync(self, order_id: str) -> bool:
         self._ensure_client()
         try:
-            result = self.client.cancel(order_id=order_id)
+            # V2 SDK uses cancel_order(order_id=...). Some versions accept just
+            # a positional arg or use bulk cancel_orders.
+            result = None
+            for attempt_method in ("cancel_order", "cancel_orders"):
+                if hasattr(self.client, attempt_method):
+                    method = getattr(self.client, attempt_method)
+                    if attempt_method == "cancel_orders":
+                        result = method([order_id])
+                    else:
+                        try:
+                            result = method(order_id=order_id)
+                        except TypeError:
+                            result = method(order_id)
+                    break
+            if result is None:
+                log.warning("no cancel method found on ClobClient")
+                return False
             ts = utc_now_iso()
             self.persistence.record_order(
                 ts=ts, action="cancel", coin="", slug="",
@@ -1413,44 +1434,45 @@ class Bot:
         """Connect to the user-channel WS to track fills on our orders.
         When a BUY fills, _handle_fill places the corresponding SELL.
         Auth is the same API creds used for placing orders."""
+        log.info("user_ws_loop: starting")
         if not is_live_mode():
             log.info("user_ws_loop: dry-run mode, skipping fill tracking")
             return
+        if not isinstance(self.executor, LivePolymarketExecutor):
+            log.info("user_ws_loop: not LivePolymarketExecutor (got %s), skipping",
+                     type(self.executor).__name__)
+            return
 
         url = CLOB_WS_URL.replace("/ws/market", "/ws/user")
+        log.info("user_ws_loop: connecting to %s", url)
         backoff = 1.0
         while True:
             try:
-                # Get API creds — only available on the live executor after first use.
-                # If executor isn't initialized yet, force it.
-                if isinstance(self.executor, LivePolymarketExecutor):
-                    if self.executor.client is None:
-                        self.executor._ensure_client()
-                    client = self.executor.client
-                else:
-                    log.info("user_ws_loop: not live executor, skipping")
-                    return
+                # Force the executor to derive API creds if it hasn't yet
+                if self.executor.client is None:
+                    log.info("user_ws_loop: forcing client init for creds")
+                    self.executor._ensure_client()
 
-                # The user WS subscription needs auth + condition IDs to subscribe.
-                # We subscribe to ALL conditions we know about.
-                conditions = list({m.condition_id for m in self.markets.values()
-                                   if m.condition_id})
-                if not conditions:
-                    await asyncio.sleep(2)
-                    continue
+                api_key = getattr(self.executor, "_api_key", None)
+                api_secret = getattr(self.executor, "_api_secret", None)
+                api_passphrase = getattr(self.executor, "_api_passphrase", None)
 
-                # Build auth payload from API creds
-                creds = getattr(client, "creds", None) or getattr(client, "api_creds", None)
-                api_key = getattr(creds, "api_key", None)
-                api_secret = getattr(creds, "api_secret", None)
-                api_passphrase = (getattr(creds, "api_passphrase", None)
-                                  or getattr(creds, "passphrase", None))
                 if not (api_key and api_secret and api_passphrase):
-                    debug.event("user_ws: missing API creds, retrying in 5s")
+                    log.warning("user_ws_loop: missing creds (key=%s secret=%s pass=%s) — retry 5s",
+                                bool(api_key), bool(api_secret), bool(api_passphrase))
                     await asyncio.sleep(5)
                     continue
 
-                debug.event(f"user_ws connecting (subscribing to {len(conditions)} conditions)")
+                # We need at least one condition_id to subscribe
+                conditions = list({m.condition_id for m in self.markets.values()
+                                   if m.condition_id})
+                if not conditions:
+                    log.info("user_ws_loop: no conditions yet, waiting 5s")
+                    await asyncio.sleep(5)
+                    continue
+
+                log.info("user_ws_loop: connecting WS, subscribing to %d conditions",
+                         len(conditions))
                 async with websockets.connect(url, ping_interval=10, ping_timeout=5,
                                               close_timeout=5) as ws:
                     backoff = 1.0
@@ -1464,26 +1486,32 @@ class Bot:
                         "type": "user",
                     }
                     await ws.send(json.dumps(sub_msg))
+                    log.info("user_ws_loop: subscribed to %d markets", len(conditions))
                     debug.event(f"user_ws subscribed to {len(conditions)} markets")
 
                     async for raw in ws:
                         try:
-                            msg = json.loads(raw)
-                        except Exception:
+                            decoded = raw if isinstance(raw, str) else raw.decode("utf-8")
+                            # Log every raw user_ws message so we can see what's coming
+                            debug.ws_msg(f"[user] {decoded[:500]}", kind="in")
+                            msg = json.loads(decoded)
+                        except Exception as exc:
+                            log.warning("user_ws parse error: %s", exc)
                             continue
                         messages = msg if isinstance(msg, list) else [msg]
                         for m in messages:
                             if not isinstance(m, dict):
                                 continue
                             etype = (m.get("event_type") or m.get("type") or "").lower()
+                            log.info("user_ws event: %s", etype or "?")
                             if etype == "trade":
                                 await self._handle_fill(m)
                             elif etype == "order":
-                                # Order state change — could include fills via match_count
                                 status = str(m.get("status", "")).lower()
                                 if status in ("matched", "filled", "partial_fill"):
                                     await self._handle_fill(m)
             except Exception as exc:
+                log.warning("user_ws error: %s — backoff %.1fs", exc, backoff)
                 debug.event(f"user_ws error: {exc} — backoff {backoff:.1f}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
