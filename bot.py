@@ -378,7 +378,15 @@ class PolyClient:
         self.http = httpx.AsyncClient(
             timeout=10.0,
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-            headers={"user-agent": "5m-crypto-bot/2.0"},
+            headers={
+                # Use a real browser UA. Cloudflare blocks generic/bot UAs
+                # and sometimes returns HTML challenge pages with status 200.
+                "user-agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/120.0.0.0 Safari/537.36"),
+                "accept": "application/json",
+                "accept-language": "en-US,en;q=0.9",
+            },
         )
 
     async def close(self) -> None:
@@ -388,10 +396,18 @@ class PolyClient:
         try:
             r = await self.http.get(f"{GAMMA_BASE_URL}/events", params={"slug": slug})
             if r.status_code != 200:
+                log.warning("gamma fetch %s → status %d", slug, r.status_code)
                 return None
-            data = r.json()
+            try:
+                data = r.json()
+            except Exception:
+                # Cloudflare sometimes returns HTML with status 200
+                snippet = r.text[:200].replace("\n", " ")
+                log.warning("gamma fetch %s → non-JSON response: %s", slug, snippet)
+                return None
             return data[0] if isinstance(data, list) and data else None
-        except Exception:
+        except Exception as exc:
+            log.warning("gamma fetch %s exception: %s", slug, exc)
             return None
 
 
@@ -1024,14 +1040,19 @@ class Bot:
         loaded. When boundaries cross, the upcoming becomes current, and the
         loop discovers the next-upcoming."""
         log.info("discovery: continuous next-window discovery (5min lookahead)")
+        iteration = 0
 
         while True:
             try:
+                iteration += 1
                 now = time.time()
                 # The "current" window is the one we're inside right now
                 current_window = (int(now) // 300) * 300
                 # The "next" window is the one after current
                 next_window = current_window + 300
+                if iteration <= 3 or iteration % 10 == 0:
+                    log.info("discovery iter %d: current=%d next=%d markets_tracked=%d",
+                             iteration, current_window, next_window, len(self.markets))
 
                 # Expire markets older than current
                 expired_slugs = [s for s, m in list(self.markets.items())
