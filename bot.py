@@ -659,6 +659,10 @@ class Bot:
         self.books: dict[str, TokenBook] = {}
         self.token_lookup: dict[str, tuple[CryptoMarket, str]] = {}
         self.triggered: set[tuple[str, str]] = set()
+        # Set of (slug, side) where we've observed the ask BELOW threshold.
+        # Required before we'll allow a trigger — prevents firing on the
+        # first WS snapshot of a stale window where ask is already 0.85+.
+        self.seen_below: set[tuple[str, str]] = set()
         self.subscription_changed = asyncio.Event()
         self.start_time = time.time()
 
@@ -676,6 +680,8 @@ class Bot:
                         self.token_lookup.pop(m.down_token_id, None)
                         self.triggered.discard((m.slug, "UP"))
                         self.triggered.discard((m.slug, "DOWN"))
+                        self.seen_below.discard((m.slug, "UP"))
+                        self.seen_below.discard((m.slug, "DOWN"))
                 if expired:
                     debug.event(f"expired {len(expired)} window(s)")
 
@@ -717,8 +723,8 @@ class Bot:
 
                 async with websockets.connect(
                     CLOB_WS_URL,
-                    ping_interval=20,
-                    ping_timeout=10,
+                    ping_interval=10,    # was 20 — faster heartbeat
+                    ping_timeout=5,      # was 10
                     close_timeout=5,
                 ) as ws:
                     backoff = 1.0
@@ -913,11 +919,24 @@ class Bot:
 
     async def _maybe_buy(self, market: CryptoMarket, side: str, ask: float) -> None:
         if ask < ENTRY_THRESHOLD or ask > ENTRY_MAX_PRICE:
+            # Mark that we've seen this side below threshold — required
+            # before any future trigger is allowed for this (slug, side).
+            if ask < ENTRY_THRESHOLD:
+                self.seen_below.add((market.slug, side))
             return
+
+        # FIX: only trigger if we previously observed this side below threshold.
+        # Otherwise the first WS snapshot of a stale window (ask already 0.85+)
+        # would fire instantly on resolved markets.
+        if (market.slug, side) not in self.seen_below:
+            return
+
         block = self._entry_blocked(market, side)
         if block:
             return
 
+        # Lock IMMEDIATELY before any await — prevents re-entry from
+        # rapid book updates while the order is in flight.
         self.triggered.add((market.slug, side))
         debug.event(f"TRIGGER {market.slug} {side} ask={ask:.4f}")
 
@@ -927,14 +946,12 @@ class Bot:
                 size_usd=POSITION_SIZE_USD, ask_price=ask,
             )
         except ExecutionError as exc:
-            debug.event(f"buy FAILED {market.slug} {side}: {exc}")
-            if market.seconds_left() > MIN_SECONDS_REMAINING:
-                self.triggered.discard((market.slug, side))
+            # FIX: keep the trigger lock on failure. Better to miss a retry
+            # than to double-fill if the order actually matched after we gave up.
+            debug.event(f"buy FAILED {market.slug} {side}: {exc} (lock kept)")
             return
         except Exception as exc:
             log.exception("buy UNEXPECTED %s %s: %s", market.slug, side, exc)
-            if market.seconds_left() > MIN_SECONDS_REMAINING:
-                self.triggered.discard((market.slug, side))
             return
 
         pos_id = self.persistence.record_position_open(pos)
