@@ -1,12 +1,16 @@
 """
-Polymarket 5m crypto ask-trigger bot.
+Polymarket 5m crypto ask-trigger bot — websocket version with debug endpoints.
 
-Tracks the best ASK on every UP and DOWN token of the active 5m crypto
-markets via WEBSOCKET (book channel). Maintains a local order book per
-token. When the best ask first reaches >= ENTRY_THRESHOLD, fires a $1
-market BUY. Each (slug, side) is bought at most once per window.
+Strategy: subscribe to the CLOB market WS for every active 5m crypto market.
+Maintain local order books. When the best ASK on UP or DOWN reaches
+ENTRY_THRESHOLD, fire a $1 BUY (one per side per window).
 
-Coins controlled by COINS env var (e.g. COINS=btc). Defaults to btc only.
+Debug endpoints:
+  /          → JSON status (markets, asks, triggers, today's P&L)
+  /healthz   → same
+  /debug     → HTML dashboard, auto-refreshes every 3s
+  /ws-log    → last 200 raw websocket messages (for diagnosing WS issues)
+  /trades    → last 50 orders + positions
 
 Safety triple — all three required for live trading:
     DRY_RUN=false  AND  TRADING_ENABLED=true  AND  ARMED_FOR_LIVE=true
@@ -20,6 +24,7 @@ import os
 import sqlite3
 import sys
 import time
+from collections import deque
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -48,7 +53,6 @@ except Exception:
     pass
 
 
-# Default to btc-only. Set COINS secret to "btc,eth,sol" etc to expand.
 COINS = [c.strip().lower() for c in _env("COINS", "btc").split(",") if c.strip()]
 ENTRY_THRESHOLD = _env("ENTRY_THRESHOLD", 0.65, float)
 ENTRY_MAX_PRICE = _env("ENTRY_MAX_PRICE", 0.97, float)
@@ -98,6 +102,34 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ─── debug ringbuffer ─────────────────────────────────────────────────────
+class DebugLog:
+    """Ring buffer for diagnostic events visible via /debug page."""
+    def __init__(self, ws_max=200, evt_max=200) -> None:
+        self.ws_messages: deque = deque(maxlen=ws_max)
+        self.events: deque = deque(maxlen=evt_max)
+        self.connect_count = 0
+        self.message_count = 0
+        self.last_ws_connect_at: Optional[float] = None
+        self.last_ws_message_at: Optional[float] = None
+        self.last_book_snapshot_at: Optional[float] = None
+        self.last_price_change_at: Optional[float] = None
+        self.unknown_event_types: dict[str, int] = {}
+
+    def event(self, msg: str) -> None:
+        self.events.append({"t": time.time(), "msg": msg})
+        log.info(msg)
+
+    def ws_msg(self, raw: str, kind: str = "in") -> None:
+        self.ws_messages.append({"t": time.time(), "kind": kind, "raw": raw[:1000]})
+        if kind == "in":
+            self.message_count += 1
+            self.last_ws_message_at = time.time()
+
+
+debug = DebugLog()
+
+
 # ─── models ───────────────────────────────────────────────────────────────
 @dataclass
 class CryptoMarket:
@@ -137,26 +169,34 @@ class Position:
 
 @dataclass
 class TokenBook:
-    """Local representation of one side of one token's order book.
-    For our purposes we only need the best ASK, but we keep the full
-    asks dict so deltas can update it correctly."""
-    asks: dict[float, float] = field(default_factory=dict)  # price -> size
+    asks: dict[float, float] = field(default_factory=dict)
+    bids: dict[float, float] = field(default_factory=dict)
     last_update_ts: float = 0.0
+    snapshot_count: int = 0
+    delta_count: int = 0
 
     def best_ask(self) -> Optional[float]:
-        if not self.asks:
-            return None
-        return min(self.asks.keys())
+        return min(self.asks.keys()) if self.asks else None
 
-    def replace_asks(self, levels: list[tuple[float, float]]) -> None:
-        self.asks = {p: s for p, s in levels if s > 0}
+    def best_bid(self) -> Optional[float]:
+        return max(self.bids.keys()) if self.bids else None
 
-    def apply_changes(self, changes: list[tuple[float, float]]) -> None:
+    def replace_book(self, asks: list[tuple[float, float]],
+                     bids: list[tuple[float, float]]) -> None:
+        self.asks = {p: s for p, s in asks if s > 0}
+        self.bids = {p: s for p, s in bids if s > 0}
+        self.snapshot_count += 1
+        self.last_update_ts = time.time()
+
+    def apply_changes(self, side: str, changes: list[tuple[float, float]]) -> None:
+        target = self.asks if side == "ask" else self.bids
         for price, size in changes:
             if size <= 0:
-                self.asks.pop(price, None)
+                target.pop(price, None)
             else:
-                self.asks[price] = size
+                target[price] = size
+        self.delta_count += 1
+        self.last_update_ts = time.time()
 
 
 # ─── persistence ──────────────────────────────────────────────────────────
@@ -268,8 +308,20 @@ class Persistence:
             ).fetchone()
             return dict(r) if r else {}
 
+    def recent_orders(self, n: int = 50) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM orders ORDER BY id DESC LIMIT ?", (n,)
+            ).fetchall()]
 
-# ─── poly REST (only for discovery + resolution) ──────────────────────────
+    def recent_positions(self, n: int = 50) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM positions ORDER BY id DESC LIMIT ?", (n,)
+            ).fetchall()]
+
+
+# ─── REST client ──────────────────────────────────────────────────────────
 class PolyClient:
     def __init__(self) -> None:
         self.http = httpx.AsyncClient(
@@ -325,7 +377,7 @@ async def fetch_market(client: PolyClient, coin: str, window_ts: int) -> Optiona
     )
 
 
-# ─── execution ────────────────────────────────────────────────────────────
+# ─── execution (unchanged from previous version) ──────────────────────────
 class ExecutionError(RuntimeError):
     pass
 
@@ -476,7 +528,6 @@ class LivePolymarketExecutor(BaseExecutor):
         except Exception as exc:
             raise ExecutionError(f"py-clob-client-v2 trading import failed: {exc}") from exc
 
-        # The websocket-derived ask is freshest. Skip the REST re-query.
         ref_ask = ask_price
 
         def build_args():
@@ -604,21 +655,17 @@ class Bot:
             self.executor = DryRunExecutor(self.persistence)
             log.info("🧪 DRY-RUN MODE")
 
-        self.markets: dict[str, CryptoMarket] = {}     # slug -> market
-        self.books: dict[str, TokenBook] = {}          # token_id -> book
-        # token_id -> (market, side) so we can look up on book updates
+        self.markets: dict[str, CryptoMarket] = {}
+        self.books: dict[str, TokenBook] = {}
         self.token_lookup: dict[str, tuple[CryptoMarket, str]] = {}
-        # Track which (slug,side) we've already triggered this window
         self.triggered: set[tuple[str, str]] = set()
-        # Signal the websocket task that the subscription set has changed
         self.subscription_changed = asyncio.Event()
+        self.start_time = time.time()
 
-    # ─── discovery ──────────────────────────────────────────────────────
     async def discovery_loop(self) -> None:
         while True:
             try:
                 window = current_window_ts()
-                # Drop expired markets and their book entries
                 expired = [s for s, m in self.markets.items() if m.window_ts < window]
                 for s in expired:
                     m = self.markets.pop(s, None)
@@ -630,9 +677,8 @@ class Bot:
                         self.triggered.discard((m.slug, "UP"))
                         self.triggered.discard((m.slug, "DOWN"))
                 if expired:
-                    log.info("expired %d windows, subscriptions will refresh", len(expired))
+                    debug.event(f"expired {len(expired)} window(s)")
 
-                # Add new markets
                 missing = [(c, window) for c in COINS
                            if f"{c}-updown-5m-{window}" not in self.markets]
                 added = 0
@@ -647,7 +693,8 @@ class Bot:
                             self.books[m.down_token_id] = TokenBook()
                             self.token_lookup[m.up_token_id] = (m, "UP")
                             self.token_lookup[m.down_token_id] = (m, "DOWN")
-                            log.info("discovered %s (%ds left)", m.slug, m.seconds_left())
+                            debug.event(f"discovered {m.slug} ({m.seconds_left()}s left, "
+                                        f"up={m.up_token_id[-8:]}, dn={m.down_token_id[-8:]})")
                             added += 1
 
                 if expired or added:
@@ -656,20 +703,17 @@ class Bot:
                 log.exception("discovery error: %s", exc)
             await asyncio.sleep(DISCOVERY_REFRESH_SECONDS)
 
-    # ─── websocket ──────────────────────────────────────────────────────
     async def websocket_loop(self) -> None:
-        """Maintain a websocket subscription to all tracked tokens.
-        Reconnects on disconnect, resubscribes when discovery changes the set.
-        """
         backoff = 1.0
         while True:
             try:
-                # Wait until we have at least one market discovered
                 while not self.token_lookup:
                     await asyncio.sleep(1)
 
                 token_ids = list(self.token_lookup.keys())
-                log.info("ws connecting (%d tokens)", len(token_ids))
+                debug.connect_count += 1
+                debug.last_ws_connect_at = time.time()
+                debug.event(f"WS connecting ({len(token_ids)} tokens)")
 
                 async with websockets.connect(
                     CLOB_WS_URL,
@@ -677,10 +721,13 @@ class Bot:
                     ping_timeout=10,
                     close_timeout=5,
                 ) as ws:
-                    backoff = 1.0  # reset on successful connect
+                    backoff = 1.0
+                    # Polymarket CLOB market WS subscribe shape
                     sub_msg = {"assets_ids": token_ids, "type": "market"}
-                    await ws.send(json.dumps(sub_msg))
-                    log.info("ws subscribed to %d tokens", len(token_ids))
+                    sub_raw = json.dumps(sub_msg)
+                    await ws.send(sub_raw)
+                    debug.ws_msg(sub_raw, kind="sub")
+                    debug.event(f"WS subscribed to {len(token_ids)} tokens")
 
                     self.subscription_changed.clear()
                     recv_task = asyncio.create_task(self._ws_recv(ws))
@@ -696,79 +743,91 @@ class Bot:
                             await t
 
                     if sub_task in done:
-                        log.info("ws subscription set changed — reconnecting")
+                        debug.event("WS subscription set changed → reconnecting")
                     else:
-                        # recv_task finished → connection died
                         exc = recv_task.exception()
                         if exc:
-                            log.warning("ws recv ended: %s", exc)
+                            debug.event(f"WS recv ended: {exc}")
                         else:
-                            log.info("ws recv ended cleanly")
+                            debug.event("WS recv ended cleanly")
             except Exception as exc:
-                log.warning("ws loop error: %s — backoff %.1fs", exc, backoff)
+                debug.event(f"WS loop error: {exc} — backoff {backoff:.1f}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
     async def _ws_recv(self, ws) -> None:
         async for raw in ws:
             try:
+                debug.ws_msg(raw if isinstance(raw, str) else raw.decode("utf-8"))
                 msg = json.loads(raw)
-            except Exception:
+            except Exception as exc:
+                debug.event(f"WS parse error: {exc}")
                 continue
 
-            # Polymarket sends single objects or lists of them
             messages = msg if isinstance(msg, list) else [msg]
             for m in messages:
                 if not isinstance(m, dict):
                     continue
-                event_type = m.get("event_type") or m.get("type")
+                event_type = (m.get("event_type") or m.get("type") or "").lower()
+
                 if event_type == "book":
                     self._handle_book_snapshot(m)
                 elif event_type == "price_change":
                     self._handle_price_change(m)
-                # ignore other event types (last_trade_price, tick_size_change)
+                elif event_type in ("last_trade_price", "tick_size_change", ""):
+                    pass
+                else:
+                    debug.unknown_event_types[event_type] = (
+                        debug.unknown_event_types.get(event_type, 0) + 1
+                    )
 
-            # After processing, evaluate triggers for any updated tokens
             await self._check_all_triggers()
 
     def _handle_book_snapshot(self, msg: dict) -> None:
         token_id = str(msg.get("asset_id") or msg.get("market") or "")
         if not token_id or token_id not in self.books:
             return
-        asks_raw = msg.get("asks") or []
-        levels = []
-        for lvl in asks_raw:
-            try:
-                price = float(lvl.get("price"))
-                size = float(lvl.get("size"))
-                levels.append((price, size))
-            except (TypeError, ValueError):
-                continue
+
+        def parse_levels(key: str) -> list[tuple[float, float]]:
+            raw = msg.get(key) or []
+            out = []
+            for lvl in raw:
+                try:
+                    out.append((float(lvl.get("price")), float(lvl.get("size"))))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        asks = parse_levels("asks")
+        bids = parse_levels("bids")
         book = self.books[token_id]
-        book.replace_asks(levels)
-        book.last_update_ts = time.time()
+        book.replace_book(asks, bids)
+        debug.last_book_snapshot_at = time.time()
 
     def _handle_price_change(self, msg: dict) -> None:
         token_id = str(msg.get("asset_id") or msg.get("market") or "")
         if not token_id or token_id not in self.books:
             return
         changes_raw = msg.get("changes") or msg.get("price_changes") or []
-        # Only process SELL-side changes (asks). BUY-side = bids, irrelevant.
-        sell_changes = []
+        ask_changes: list[tuple[float, float]] = []
+        bid_changes: list[tuple[float, float]] = []
         for ch in changes_raw:
-            side_str = str(ch.get("side", "")).upper()
-            if side_str not in ("SELL", "ASK"):
-                continue
+            side_str = str(ch.get("side", "")).lower()
             try:
                 price = float(ch.get("price"))
                 size = float(ch.get("size"))
-                sell_changes.append((price, size))
             except (TypeError, ValueError):
                 continue
-        if sell_changes:
-            book = self.books[token_id]
-            book.apply_changes(sell_changes)
-            book.last_update_ts = time.time()
+            if side_str in ("sell", "ask", "asks"):
+                ask_changes.append((price, size))
+            elif side_str in ("buy", "bid", "bids"):
+                bid_changes.append((price, size))
+        book = self.books[token_id]
+        if ask_changes:
+            book.apply_changes("ask", ask_changes)
+        if bid_changes:
+            book.apply_changes("bid", bid_changes)
+        debug.last_price_change_at = time.time()
 
     async def _check_all_triggers(self) -> None:
         for token_id, book in self.books.items():
@@ -780,7 +839,6 @@ class Bot:
             market, side = self.token_lookup[token_id]
             await self._maybe_buy(market, side, ask)
 
-    # ─── resolution ─────────────────────────────────────────────────────
     async def resolution_loop(self) -> None:
         while True:
             try:
@@ -812,9 +870,8 @@ class Bot:
                         pnl = gross - p["size_usd"]
                         reason = "win" if won else "loss"
                         self.persistence.update_position_resolved(p["id"], pnl, reason)
-                        log.info("%s %s %s: %+.4f (entry %.4f × %.4f shares)",
-                                 "✓" if won else "✗", p["side"], p["slug"],
-                                 pnl, p["entry_price"], p["shares"])
+                        debug.event(f"{'✓' if won else '✗'} {p['side']} {p['slug']}: "
+                                    f"{pnl:+.4f} (entry {p['entry_price']:.4f} × {p['shares']:.4f})")
             except Exception as exc:
                 log.exception("resolution loop error: %s", exc)
             await asyncio.sleep(15)
@@ -827,17 +884,12 @@ class Bot:
                 losses = s.get("losses") or 0
                 closed = wins + losses
                 wr = (wins / closed * 100) if closed else 0.0
-                # Show a sample ask so we know the WS is alive
-                sample = ""
-                for tid, book in list(self.books.items())[:1]:
-                    a = book.best_ask()
-                    if a is not None and tid in self.token_lookup:
-                        m, side = self.token_lookup[tid]
-                        age = time.time() - book.last_update_ts
-                        sample = f" · {m.coin} {side} ask {a:.3f} ({age:.0f}s ago)"
-                log.info("📊 %d open · %dW %dL %.1f%% · pnl %+.2f · markets %d%s",
+                ws_age = (time.time() - debug.last_ws_message_at) if debug.last_ws_message_at else None
+                ws_age_s = f"{ws_age:.0f}s ago" if ws_age is not None else "never"
+                log.info("📊 %d open · %dW %dL %.1f%% · pnl %+.2f · markets %d · ws msgs %d (last %s)",
                          s.get("open_n") or 0, wins, losses, wr,
-                         s.get("pnl") or 0.0, len(self.markets), sample)
+                         s.get("pnl") or 0.0, len(self.markets),
+                         debug.message_count, ws_age_s)
             except Exception:
                 pass
             await asyncio.sleep(60)
@@ -860,16 +912,14 @@ class Bot:
         return None
 
     async def _maybe_buy(self, market: CryptoMarket, side: str, ask: float) -> None:
-        if ask < ENTRY_THRESHOLD:
-            return
-        if ask > ENTRY_MAX_PRICE:
+        if ask < ENTRY_THRESHOLD or ask > ENTRY_MAX_PRICE:
             return
         block = self._entry_blocked(market, side)
         if block:
             return
 
-        # Mark triggered IMMEDIATELY to prevent re-entry from rapid book updates
         self.triggered.add((market.slug, side))
+        debug.event(f"TRIGGER {market.slug} {side} ask={ask:.4f}")
 
         try:
             pos = await self.executor.buy(
@@ -877,9 +927,7 @@ class Bot:
                 size_usd=POSITION_SIZE_USD, ask_price=ask,
             )
         except ExecutionError as exc:
-            log.error("buy failed %s %s: %s", market.slug, side, exc)
-            # Allow retry on next book update — failed buys shouldn't lock the slot forever.
-            # But only retry if window still has time; otherwise leave triggered (window's gone).
+            debug.event(f"buy FAILED {market.slug} {side}: {exc}")
             if market.seconds_left() > MIN_SECONDS_REMAINING:
                 self.triggered.discard((market.slug, side))
             return
@@ -890,9 +938,8 @@ class Bot:
             return
 
         pos_id = self.persistence.record_position_open(pos)
-        log.info("ENTERED #%d %s %s @ %.4f ($%.2f, %.4f shares, %ds left, ws-ask %.4f)",
-                 pos_id, side, market.slug, pos.entry_price,
-                 pos.size_usd, pos.shares, market.seconds_left(), ask)
+        debug.event(f"ENTERED #{pos_id} {side} {market.slug} @ {pos.entry_price:.4f} "
+                    f"({pos.shares:.4f} shares, {market.seconds_left()}s left)")
 
     async def healthcheck_server(self) -> None:
         try:
@@ -901,50 +948,105 @@ class Bot:
             log.info("aiohttp not installed — skipping healthcheck server")
             return
 
-        async def handle(_req):
-            s = self.persistence.stats_today()
-            # Show fresh asks per market for debugging
+        bot = self  # closure
+
+        def now_iso() -> str:
+            return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        def status_json() -> dict:
+            s = bot.persistence.stats_today()
             current = {}
-            for slug, m in self.markets.items():
-                up_book = self.books.get(m.up_token_id)
-                dn_book = self.books.get(m.down_token_id)
+            for slug, m in bot.markets.items():
+                up_book = bot.books.get(m.up_token_id)
+                dn_book = bot.books.get(m.down_token_id)
                 current[slug] = {
-                    "up_ask": up_book.best_ask() if up_book else None,
-                    "down_ask": dn_book.best_ask() if dn_book else None,
+                    "coin": m.coin,
                     "seconds_left": m.seconds_left(),
-                    "triggered_up": (slug, "UP") in self.triggered,
-                    "triggered_down": (slug, "DOWN") in self.triggered,
+                    "up_ask": up_book.best_ask() if up_book else None,
+                    "up_bid": up_book.best_bid() if up_book else None,
+                    "up_levels": len(up_book.asks) if up_book else 0,
+                    "down_ask": dn_book.best_ask() if dn_book else None,
+                    "down_bid": dn_book.best_bid() if dn_book else None,
+                    "down_levels": len(dn_book.asks) if dn_book else 0,
+                    "triggered_up": (slug, "UP") in bot.triggered,
+                    "triggered_down": (slug, "DOWN") in bot.triggered,
                 }
-            return web.json_response({
+            ws_age = ((time.time() - debug.last_ws_message_at)
+                      if debug.last_ws_message_at else None)
+            return {
                 "status": "ok",
+                "now": now_iso(),
+                "uptime_seconds": int(time.time() - bot.start_time),
                 "live_mode": is_live_mode(),
-                "coins": COINS,
-                "threshold": ENTRY_THRESHOLD,
-                "stake_usd": POSITION_SIZE_USD,
-                "markets_tracked": len(self.markets),
+                "config": {
+                    "coins": COINS,
+                    "threshold": ENTRY_THRESHOLD,
+                    "max_price": ENTRY_MAX_PRICE,
+                    "stake_usd": POSITION_SIZE_USD,
+                    "min_seconds_remaining": MIN_SECONDS_REMAINING,
+                    "max_concurrent": MAX_CONCURRENT_POSITIONS,
+                    "max_daily_loss": MAX_DAILY_LOSS_USD,
+                    "kill_switch": KILL_SWITCH,
+                    "dry_run": DRY_RUN,
+                    "trading_enabled": TRADING_ENABLED,
+                    "armed_for_live": ARMED_FOR_LIVE,
+                },
+                "ws": {
+                    "connect_count": debug.connect_count,
+                    "message_count": debug.message_count,
+                    "last_message_age_seconds": ws_age,
+                    "last_book_snapshot_age_seconds": (
+                        time.time() - debug.last_book_snapshot_at
+                        if debug.last_book_snapshot_at else None),
+                    "last_price_change_age_seconds": (
+                        time.time() - debug.last_price_change_at
+                        if debug.last_price_change_at else None),
+                    "unknown_event_types": dict(debug.unknown_event_types),
+                },
+                "markets_tracked": len(bot.markets),
                 "today": dict(s),
                 "current": current,
+            }
+
+        async def handle_status(_req):
+            return web.json_response(status_json())
+
+        async def handle_ws_log(_req):
+            return web.json_response({
+                "connect_count": debug.connect_count,
+                "message_count": debug.message_count,
+                "messages": list(debug.ws_messages),
             })
 
+        async def handle_trades(_req):
+            return web.json_response({
+                "recent_orders": bot.persistence.recent_orders(50),
+                "recent_positions": bot.persistence.recent_positions(50),
+            })
+
+        async def handle_debug_html(_req):
+            return web.Response(text=DEBUG_HTML, content_type="text/html")
+
         app = web.Application()
-        app.router.add_get("/healthz", handle)
-        app.router.add_get("/", handle)
+        app.router.add_get("/", handle_status)
+        app.router.add_get("/healthz", handle_status)
+        app.router.add_get("/ws-log", handle_ws_log)
+        app.router.add_get("/trades", handle_trades)
+        app.router.add_get("/debug", handle_debug_html)
+
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", HEALTHCHECK_PORT)
         await site.start()
-        log.info("healthcheck listening on :%d", HEALTHCHECK_PORT)
+        log.info("HTTP server on :%d  →  /  /debug  /ws-log  /trades", HEALTHCHECK_PORT)
 
     async def run(self) -> None:
         log.info("─" * 60)
-        log.info("Polymarket 5m crypto WS-ask bot")
+        log.info("Polymarket 5m crypto WS-ask bot (with /debug)")
         log.info("  coins:     %s", ",".join(COINS))
         log.info("  threshold: ask >= %.2f and <= %.2f", ENTRY_THRESHOLD, ENTRY_MAX_PRICE)
         log.info("  size:      $%.2f", POSITION_SIZE_USD)
-        log.info("  max conc:  %s", "unlimited" if MAX_CONCURRENT_POSITIONS <= 0 else MAX_CONCURRENT_POSITIONS)
-        log.info("  daily cap: $%.2f", MAX_DAILY_LOSS_USD)
         log.info("  mode:      %s", "LIVE" if is_live_mode() else "DRY-RUN")
-        log.info("  data:      websocket (%s)", CLOB_WS_URL)
         log.info("─" * 60)
 
         try:
@@ -957,6 +1059,220 @@ class Bot:
             )
         finally:
             await self.client.close()
+
+
+# ─── /debug HTML page ─────────────────────────────────────────────────────
+DEBUG_HTML = r"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>poly5m bot · debug</title>
+<style>
+  body { background:#0a0a0a; color:#e0e0e0; font: 13px/1.4 ui-monospace, Menlo, Consolas, monospace; margin:0; padding:16px; }
+  h1, h2 { font-weight:600; margin: 12px 0 6px; }
+  h1 { font-size:18px; color:#f5d14a; }
+  h2 { font-size:13px; color:#888; text-transform:uppercase; letter-spacing:.1em; border-top:1px solid #222; padding-top:14px; margin-top:18px; }
+  .row { display:flex; gap:16px; flex-wrap:wrap; }
+  .box { border:1px solid #222; padding:10px 12px; background:#111; min-width:160px; }
+  .box .label { color:#888; font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+  .box .val { font-size:18px; color:#fff; margin-top:4px; }
+  .good { color:#4ade80; }
+  .bad  { color:#ef4444; }
+  .warn { color:#f5d14a; }
+  .dim  { color:#666; }
+  table { border-collapse:collapse; width:100%; margin-top:8px; font-size:12px; }
+  th, td { text-align:left; padding:5px 10px; border-bottom:1px solid #1a1a1a; }
+  th { color:#888; font-weight:500; text-transform:uppercase; font-size:11px; letter-spacing:.05em; }
+  td.num { text-align:right; font-variant-numeric: tabular-nums; }
+  .pill { display:inline-block; padding:1px 6px; border-radius:3px; font-size:11px; }
+  .pill.live { background:#7f1d1d; color:#fecaca; }
+  .pill.dry  { background:#1e3a8a; color:#bfdbfe; }
+  pre { background:#0a0a0a; border:1px solid #1a1a1a; padding:8px; max-height:240px; overflow:auto; font-size:11px; color:#aaa; white-space:pre-wrap; word-break:break-all; }
+  a { color:#60a5fa; }
+</style>
+</head><body>
+
+<h1>poly5m bot · debug <span id="mode-pill"></span></h1>
+<div class="dim" id="meta"></div>
+
+<h2>Health</h2>
+<div class="row" id="health"></div>
+
+<h2>Today</h2>
+<div class="row" id="today"></div>
+
+<h2>Active markets</h2>
+<table id="markets-tbl">
+  <thead><tr>
+    <th>SLUG</th><th>COIN</th><th class="num">SECS LEFT</th>
+    <th class="num">UP ASK</th><th class="num">UP BID</th><th class="num">UP LV</th><th>UP TRIG</th>
+    <th class="num">DN ASK</th><th class="num">DN BID</th><th class="num">DN LV</th><th>DN TRIG</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>Recent events <span class="dim">(live)</span></h2>
+<pre id="events"></pre>
+
+<h2>Last 30 raw WS messages</h2>
+<pre id="ws"></pre>
+
+<h2>Recent orders</h2>
+<table id="orders-tbl">
+  <thead><tr>
+    <th>TS</th><th>ACTION</th><th>COIN</th><th>SIDE</th>
+    <th class="num">PRICE</th><th class="num">SIZE</th><th class="num">SHARES</th><th>STATUS</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>Recent positions</h2>
+<table id="positions-tbl">
+  <thead><tr>
+    <th>TS</th><th>SLUG</th><th>SIDE</th>
+    <th class="num">ENTRY</th><th class="num">SHARES</th><th>STATUS</th><th class="num">P&amp;L</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+
+<script>
+const fmt = {
+  pct: n => (n == null) ? '—' : (n*100).toFixed(1) + '%',
+  num: n => (n == null) ? '—' : Number(n).toFixed(4),
+  ago: s => s == null ? 'never' : (s < 60 ? Math.round(s)+'s' : Math.round(s/60)+'m') + ' ago',
+  usd: n => (n == null) ? '—' : (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(2),
+};
+
+function colorAge(ageSec) {
+  if (ageSec == null) return 'bad';
+  if (ageSec < 10) return 'good';
+  if (ageSec < 60) return 'warn';
+  return 'bad';
+}
+
+async function refresh() {
+  try {
+    const [statusR, wsR, tradesR] = await Promise.all([
+      fetch('/').then(r => r.json()),
+      fetch('/ws-log').then(r => r.json()),
+      fetch('/trades').then(r => r.json()),
+    ]);
+
+    document.getElementById('mode-pill').innerHTML =
+      statusR.live_mode
+        ? '<span class="pill live">LIVE</span>'
+        : '<span class="pill dry">DRY-RUN</span>';
+
+    document.getElementById('meta').textContent =
+      `${statusR.now}  ·  uptime ${Math.round(statusR.uptime_seconds/60)}min  ·  ` +
+      `coins ${statusR.config.coins.join(',')}  ·  threshold ${statusR.config.threshold}  ·  ` +
+      `stake $${statusR.config.stake_usd}  ·  max_concurrent ${statusR.config.max_concurrent}`;
+
+    const ws = statusR.ws;
+    const wsAgeClass = colorAge(ws.last_message_age_seconds);
+    document.getElementById('health').innerHTML = `
+      <div class="box"><div class="label">WS connects</div><div class="val">${ws.connect_count}</div></div>
+      <div class="box"><div class="label">WS messages</div><div class="val">${ws.message_count}</div></div>
+      <div class="box"><div class="label">Last WS msg</div><div class="val ${wsAgeClass}">${fmt.ago(ws.last_message_age_seconds)}</div></div>
+      <div class="box"><div class="label">Last book snap</div><div class="val ${colorAge(ws.last_book_snapshot_age_seconds)}">${fmt.ago(ws.last_book_snapshot_age_seconds)}</div></div>
+      <div class="box"><div class="label">Last price chg</div><div class="val ${colorAge(ws.last_price_change_age_seconds)}">${fmt.ago(ws.last_price_change_age_seconds)}</div></div>
+      <div class="box"><div class="label">Markets tracked</div><div class="val">${statusR.markets_tracked}</div></div>
+      <div class="box"><div class="label">Unknown WS events</div><div class="val ${Object.keys(ws.unknown_event_types || {}).length ? 'warn' : ''}">${JSON.stringify(ws.unknown_event_types || {})}</div></div>
+    `;
+
+    const t = statusR.today;
+    const closed = (t.wins||0)+(t.losses||0);
+    const wr = closed ? (t.wins/closed) : null;
+    const pnl = t.pnl || 0;
+    document.getElementById('today').innerHTML = `
+      <div class="box"><div class="label">Open</div><div class="val">${t.open_n||0}</div></div>
+      <div class="box"><div class="label">Wins</div><div class="val good">${t.wins||0}</div></div>
+      <div class="box"><div class="label">Losses</div><div class="val bad">${t.losses||0}</div></div>
+      <div class="box"><div class="label">Win rate</div><div class="val">${fmt.pct(wr)}</div></div>
+      <div class="box"><div class="label">P&amp;L today</div><div class="val ${pnl>0?'good':pnl<0?'bad':''}">${fmt.usd(pnl)}</div></div>
+    `;
+
+    const mTbody = document.querySelector('#markets-tbl tbody');
+    mTbody.innerHTML = '';
+    const cur = statusR.current || {};
+    const slugs = Object.keys(cur).sort();
+    if (slugs.length === 0) {
+      mTbody.innerHTML = '<tr><td colspan="11" class="dim">no active markets — discovery in progress</td></tr>';
+    }
+    for (const slug of slugs) {
+      const c = cur[slug];
+      const upHit  = c.up_ask  != null && c.up_ask  >= statusR.config.threshold;
+      const dnHit  = c.down_ask != null && c.down_ask >= statusR.config.threshold;
+      mTbody.innerHTML += `
+        <tr>
+          <td>${slug}</td>
+          <td>${c.coin}</td>
+          <td class="num ${c.seconds_left<MIN_SEC?'warn':''}">${c.seconds_left}</td>
+          <td class="num ${upHit?'good':''}">${fmt.num(c.up_ask)}</td>
+          <td class="num dim">${fmt.num(c.up_bid)}</td>
+          <td class="num dim">${c.up_levels}</td>
+          <td class="${c.triggered_up?'good':'dim'}">${c.triggered_up?'✓':'·'}</td>
+          <td class="num ${dnHit?'good':''}">${fmt.num(c.down_ask)}</td>
+          <td class="num dim">${fmt.num(c.down_bid)}</td>
+          <td class="num dim">${c.down_levels}</td>
+          <td class="${c.triggered_down?'good':'dim'}">${c.triggered_down?'✓':'·'}</td>
+        </tr>`;
+    }
+
+    // WS messages
+    const msgs = (wsR.messages || []).slice(-30).reverse();
+    document.getElementById('ws').textContent =
+      msgs.map(m => `[${new Date(m.t*1000).toLocaleTimeString()}] ${m.kind}: ${m.raw}`).join('\n') || '(none)';
+
+    // Orders
+    const oTbody = document.querySelector('#orders-tbl tbody');
+    oTbody.innerHTML = '';
+    for (const o of (tradesR.recent_orders || []).slice(0,20)) {
+      oTbody.innerHTML += `
+        <tr>
+          <td class="dim">${o.ts ? o.ts.slice(11,19) : ''}</td>
+          <td>${o.action}</td>
+          <td>${o.coin}</td>
+          <td>${o.side}</td>
+          <td class="num">${fmt.num(o.price)}</td>
+          <td class="num">$${(o.size_usd||0).toFixed(2)}</td>
+          <td class="num">${fmt.num(o.shares)}</td>
+          <td class="dim">${o.status}</td>
+        </tr>`;
+    }
+    if (!tradesR.recent_orders || !tradesR.recent_orders.length) {
+      oTbody.innerHTML = '<tr><td colspan="8" class="dim">no orders yet</td></tr>';
+    }
+
+    // Positions
+    const pTbody = document.querySelector('#positions-tbl tbody');
+    pTbody.innerHTML = '';
+    for (const p of (tradesR.recent_positions || []).slice(0,20)) {
+      const cls = p.pnl_usd > 0 ? 'good' : p.pnl_usd < 0 ? 'bad' : 'dim';
+      pTbody.innerHTML += `
+        <tr>
+          <td class="dim">${p.ts ? p.ts.slice(11,19) : ''}</td>
+          <td>${p.slug || ''}</td>
+          <td>${p.side}</td>
+          <td class="num">${fmt.num(p.entry_price)}</td>
+          <td class="num">${fmt.num(p.shares)}</td>
+          <td>${p.status}</td>
+          <td class="num ${cls}">${p.pnl_usd != null ? fmt.usd(p.pnl_usd) : '—'}</td>
+        </tr>`;
+    }
+    if (!tradesR.recent_positions || !tradesR.recent_positions.length) {
+      pTbody.innerHTML = '<tr><td colspan="7" class="dim">no positions yet</td></tr>';
+    }
+  } catch (e) {
+    document.getElementById('meta').textContent = 'fetch error: ' + e.message;
+  }
+}
+
+const MIN_SEC = 20;
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body></html>
+"""
 
 
 def main() -> None:
