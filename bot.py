@@ -104,6 +104,14 @@ def _parse_limit_prices(raw: str) -> list[float]:
 
 LIMIT_PRICES = _parse_limit_prices(os.environ.get("LIMIT_PRICES", "0.40,0.50")) or [0.40, 0.50]
 
+# Pre-market buy ladder: place BUY limits at these prices on both UP and DOWN
+# the moment the market is created. Default: [0.40, 0.45].
+LIMIT_BUY_PRICES = _parse_limit_prices(os.environ.get("LIMIT_BUY_PRICES", "0.40,0.45")) or [0.40, 0.45]
+# When a BUY fills, immediately place a SELL at this price on the same side.
+LIMIT_SELL_PRICE = _env("LIMIT_SELL_PRICE", 0.50, float)
+# Cancel unfilled BUY limits N seconds after window opens (give a tiny grace period).
+CANCEL_BUYS_AT_OPEN_DELAY = _env("CANCEL_BUYS_AT_OPEN_DELAY", 0, int)
+
 MAX_CONCURRENT_POSITIONS = _env("MAX_CONCURRENT_POSITIONS", 0, int)
 MAX_DAILY_LOSS_USD = _env("MAX_DAILY_LOSS_USD", 50.0, float)
 KILL_SWITCH = _env("KILL_SWITCH", False, bool)
@@ -463,6 +471,16 @@ class BaseExecutor:
         and shares (size_usd / limit_price). Order rests in book."""
         raise NotImplementedError
 
+    async def place_limit_sell(self, *, market: CryptoMarket, side: str,
+                               shares: float, limit_price: float) -> dict:
+        """Place a GTC limit SELL of `shares` at limit_price. Used to
+        offload shares we previously bought."""
+        raise NotImplementedError
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel a resting order by ID. Returns True if cancelled."""
+        raise NotImplementedError
+
 
 class DryRunExecutor(BaseExecutor):
     async def buy(self, *, market: CryptoMarket, side: str, size_usd: float,
@@ -490,15 +508,33 @@ class DryRunExecutor(BaseExecutor):
         token_id = market.up_token_id if side == "UP" else market.down_token_id
         shares = size_usd / limit_price if limit_price > 0 else 0.0
         ts = utc_now_iso()
+        order_id = f"DRY-BUY-{int(time.time()*1000000)}"
         self.persistence.record_order(
-            ts=ts, action="limit_dry", coin=market.coin, slug=market.slug,
+            ts=ts, action="limit_dry_buy", coin=market.coin, slug=market.slug,
             condition_id=market.condition_id, token_id=token_id,
             side=side, price=limit_price, size_usd=size_usd, shares=shares,
-            status="dry_run_resting", order_id=f"DRY-{int(time.time()*1000)}",
+            status="dry_run_resting", order_id=order_id,
             payload={"window_ts": market.window_ts, "limit_price": limit_price,
-                     "type": "GTC"},
+                     "type": "GTC", "intent": "buy"},
         )
-        return {"order_id": None, "shares": shares, "limit_price": limit_price}
+        return {"order_id": order_id, "shares": shares, "limit_price": limit_price}
+
+    async def place_limit_sell(self, *, market, side, shares, limit_price):
+        token_id = market.up_token_id if side == "UP" else market.down_token_id
+        ts = utc_now_iso()
+        order_id = f"DRY-SELL-{int(time.time()*1000000)}"
+        self.persistence.record_order(
+            ts=ts, action="limit_dry_sell", coin=market.coin, slug=market.slug,
+            condition_id=market.condition_id, token_id=token_id,
+            side=side, price=limit_price, size_usd=shares*limit_price, shares=shares,
+            status="dry_run_resting", order_id=order_id,
+            payload={"window_ts": market.window_ts, "limit_price": limit_price,
+                     "type": "GTC", "intent": "sell"},
+        )
+        return {"order_id": order_id, "shares": shares, "limit_price": limit_price}
+
+    async def cancel_order(self, order_id: str) -> bool:
+        return True
 
 
 class LivePolymarketExecutor(BaseExecutor):
@@ -806,6 +842,119 @@ class LivePolymarketExecutor(BaseExecutor):
         return {"order_id": order_id, "shares": shares,
                 "limit_price": order_price, "status": order_status}
 
+    async def place_limit_sell(self, *, market: CryptoMarket, side: str,
+                               shares: float, limit_price: float) -> dict:
+        """Place GTC limit SELL of `shares` at limit_price."""
+        if not is_live_mode():
+            raise ExecutionError("live_mode_not_armed")
+        token_id = market.up_token_id if side == "UP" else market.down_token_id
+        loop = asyncio.get_running_loop()
+        if not hasattr(self, "_executor_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+            self._executor_pool = ThreadPoolExecutor(max_workers=16,
+                                                     thread_name_prefix="poly-buy")
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._executor_pool, self._place_limit_sell_sync,
+                    market, side, token_id, shares, limit_price,
+                ),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            raise ExecutionError("limit_sell_place_timeout (10s)")
+
+    def _place_limit_sell_sync(self, market: CryptoMarket, side: str, token_id: str,
+                               shares: float, limit_price: float) -> dict:
+        self._ensure_client()
+        try:
+            from py_clob_client_v2 import (
+                OrderArgs, OrderType, PartialCreateOrderOptions, Side,
+            )
+        except Exception as exc:
+            raise ExecutionError(f"py-clob-client-v2 trading import failed: {exc}") from exc
+
+        order_tick = _tick_for_price(limit_price, market_min_tick=market.min_tick_size)
+        order_price = _round_to_tick(limit_price, order_tick)
+        actual_neg_risk = self._resolve_neg_risk(token_id, fallback=bool(market.neg_risk))
+
+        args = OrderArgs(
+            token_id=token_id, price=order_price,
+            size=float(shares), side=Side.SELL,
+        )
+        options = PartialCreateOrderOptions(tick_size=order_tick, neg_risk=actual_neg_risk)
+
+        response = None
+        for attempt in (1, 2):
+            try:
+                response = self.client.create_and_post_order(
+                    order_args=args, options=options, order_type=OrderType.GTC,
+                )
+                break
+            except Exception as exc:
+                msg = str(exc).lower()
+                if attempt == 1 and "invalid signature" in msg:
+                    self.client = None
+                    try:
+                        self._ensure_client()
+                        continue
+                    except Exception as re_exc:
+                        raise ExecutionError(f"sell_failed: re-derive: {re_exc}") from re_exc
+                raise ExecutionError(f"sell_failed: {type(exc).__name__}: {exc}") from exc
+
+        order_id = None
+        order_status = "submitted"
+        if isinstance(response, dict):
+            order_id = (response.get("orderID") or response.get("order_id")
+                        or response.get("orderId"))
+            order_status = str(response.get("status", "submitted"))
+
+        ts = utc_now_iso()
+        self.persistence.record_order(
+            ts=ts, action="limit_sell_placed", coin=market.coin, slug=market.slug,
+            condition_id=market.condition_id, token_id=token_id, side=side,
+            price=order_price, size_usd=shares*order_price, shares=shares,
+            status=order_status, order_id=order_id,
+            payload={"limit_price": order_price, "type": "GTC", "intent": "sell",
+                     "window_ts": market.window_ts},
+        )
+        return {"order_id": order_id, "shares": shares,
+                "limit_price": order_price, "status": order_status}
+
+    async def cancel_order(self, order_id: str) -> bool:
+        if not is_live_mode():
+            return True
+        loop = asyncio.get_running_loop()
+        if not hasattr(self, "_executor_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+            self._executor_pool = ThreadPoolExecutor(max_workers=16,
+                                                     thread_name_prefix="poly-buy")
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(self._executor_pool, self._cancel_sync, order_id),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning("cancel timeout for %s", order_id)
+            return False
+
+    def _cancel_sync(self, order_id: str) -> bool:
+        self._ensure_client()
+        try:
+            result = self.client.cancel(order_id=order_id)
+            ts = utc_now_iso()
+            self.persistence.record_order(
+                ts=ts, action="cancel", coin="", slug="",
+                condition_id="", token_id="", side="",
+                price=0.0, size_usd=0.0, shares=0.0,
+                status="cancelled", order_id=order_id,
+                payload={"result": result if isinstance(result, dict) else str(result)},
+            )
+            return True
+        except Exception as exc:
+            log.warning("cancel failed for %s: %s", order_id, exc)
+            return False
+
 
 # ─── bot ──────────────────────────────────────────────────────────────────
 class Bot:
@@ -829,6 +978,20 @@ class Bot:
         self.seen_below: set[tuple[str, str, int]] = set()
         self.subscription_changed = asyncio.Event()
         self.start_time = time.time()
+
+        # Track BUY orders by slug for cancellation at boundary.
+        # slug → list[order_id]
+        self.buy_orders_by_slug: dict[str, list[str]] = {}
+        # Track which (slug, side, price) we've already placed a BUY for —
+        # prevents duplicate orders if new_market arrives multiple times or
+        # if discovery loop races with new_market event.
+        self.buys_placed: set[tuple[str, str, float]] = set()
+        # Track fills we've already responded to with a sell, to prevent
+        # placing duplicate sells if user-channel sends repeat events.
+        self.sells_placed_for_order: set[str] = set()
+        # Slugs we've fully processed (placed orders for). Prevents re-placing
+        # if new_market and discovery_loop both find the same slug.
+        self.markets_initialized: set[str] = set()
 
     async def discovery_loop(self) -> None:
         """Start polling 10s BEFORE each 5-min boundary. Polymarket may
@@ -895,8 +1058,13 @@ class Bot:
                 await asyncio.sleep(1.0)
 
     async def _on_market_discovered(self, m: CryptoMarket, attempt: int) -> None:
-        """Called once per new market. Registers it and (if STRATEGY=limits)
-        immediately fires off the resting limit orders."""
+        """Called when a market is found via Gamma poll. Registers it and (if
+        STRATEGY=limits) places the BUY ladder. Idempotent: won't re-place if
+        the new_market WS event already handled this slug."""
+        if m.slug in self.markets_initialized:
+            return
+        self.markets_initialized.add(m.slug)
+
         latency_ms = (time.time() - m.window_ts) * 1000
         self.markets[m.slug] = m
         self.books[m.up_token_id] = TokenBook()
@@ -904,39 +1072,199 @@ class Bot:
         self.token_lookup[m.up_token_id] = (m, "UP")
         self.token_lookup[m.down_token_id] = (m, "DOWN")
         debug.event(f"discovered {m.slug} ({m.seconds_left()}s left, "
-                    f"+{latency_ms:.0f}ms after open, attempt {attempt})")
+                    f"+{latency_ms:.0f}ms after open, source=gamma attempt {attempt})")
 
         if STRATEGY == "limits":
-            # Fire all limit orders concurrently for max speed
-            tasks = []
-            for side in ("UP", "DOWN"):
-                for limit_price in LIMIT_PRICES:
-                    tasks.append(self._place_one_limit(m, side, limit_price))
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await self._fire_buy_ladder(m, source="gamma")
 
-    async def _place_one_limit(self, market: CryptoMarket, side: str,
-                               limit_price: float) -> None:
+    async def _handle_new_market(self, msg: dict) -> None:
+        """Handle a 'new_market' WS event — Polymarket pushes this the
+        moment a market is created. Includes clob_token_ids, so we can
+        fire orders without waiting for Gamma to index. This is the
+        zero-latency path for catching pre-market windows."""
+        try:
+            slug = str(msg.get("slug") or "")
+            if not slug:
+                return
+            # Filter for our coins + 5m markets only
+            if "-updown-5m-" not in slug:
+                return
+            coin = slug.split("-updown-5m-")[0]
+            if coin not in COINS:
+                return
+            try:
+                window_ts = int(slug.rsplit("-", 1)[-1])
+            except ValueError:
+                return
+
+            if slug in self.markets_initialized:
+                return  # already handled by Gamma poll
+
+            token_ids = msg.get("clob_token_ids") or msg.get("assets_ids") or []
+            if len(token_ids) < 2:
+                debug.event(f"new_market {slug} missing token_ids: {msg}")
+                return
+            condition_id = str(msg.get("condition_id") or "")
+
+            m = CryptoMarket(
+                coin=coin, window_ts=window_ts, slug=slug,
+                event_id=str(msg.get("event_id") or ""),
+                condition_id=condition_id,
+                up_token_id=str(token_ids[0]),
+                down_token_id=str(token_ids[1]),
+                min_tick_size=str(msg.get("order_price_min_tick_size") or "0.01"),
+                neg_risk=bool(msg.get("neg_risk", False)),
+            )
+
+            self.markets_initialized.add(slug)
+            self.markets[slug] = m
+            self.books[m.up_token_id] = TokenBook()
+            self.books[m.down_token_id] = TokenBook()
+            self.token_lookup[m.up_token_id] = (m, "UP")
+            self.token_lookup[m.down_token_id] = (m, "DOWN")
+            self.subscription_changed.set()
+
+            secs_until_open = window_ts - time.time()
+            debug.event(f"NEW_MARKET ws-event {slug} ({secs_until_open:+.1f}s to open) "
+                        f"— firing pre-market orders")
+
+            if STRATEGY == "limits":
+                await self._fire_buy_ladder(m, source="ws_new_market")
+        except Exception as exc:
+            log.exception("new_market handler error: %s", exc)
+
+    async def _fire_buy_ladder(self, m: CryptoMarket, source: str) -> None:
+        """Place BUY limits at LIMIT_BUY_PRICES on both sides, concurrently.
+        Records order IDs in self.buy_orders_by_slug for later cancellation."""
+        tasks = []
+        for side in ("UP", "DOWN"):
+            for buy_price in LIMIT_BUY_PRICES:
+                tasks.append(self._place_one_buy(m, side, buy_price, source))
+        await asyncio.gather(*tasks, return_exceptions=True)
+        # Schedule a one-shot task to cancel any unfilled BUY orders for
+        # this slug shortly after the window opens.
+        asyncio.create_task(self._cancel_buys_at_open(m))
+
+    async def _place_one_buy(self, market: CryptoMarket, side: str,
+                             buy_price: float, source: str) -> None:
+        # Dedup: if we've already placed this exact buy for this slug+side+price, skip
+        key = (market.slug, side, buy_price)
+        if key in self.buys_placed:
+            return
+        self.buys_placed.add(key)
+
         try:
             result = await self.executor.place_limit(
                 market=market, side=side,
-                size_usd=POSITION_SIZE_USD, limit_price=limit_price,
+                size_usd=POSITION_SIZE_USD, limit_price=buy_price,
             )
-            debug.event(f"LIMIT placed {market.slug} {side} @ {limit_price} "
-                        f"({result.get('shares', 0):.4f} shares, id={result.get('order_id')})")
+            order_id = result.get("order_id")
+            if order_id:
+                self.buy_orders_by_slug.setdefault(market.slug, []).append(order_id)
+            debug.event(f"BUY placed {market.slug} {side} @ {buy_price} "
+                        f"({result.get('shares', 0):.4f} sh, id={order_id}, src={source})")
         except ExecutionError as exc:
-            debug.event(f"LIMIT failed {market.slug} {side} @ {limit_price}: {exc}")
+            self.buys_placed.discard(key)  # allow retry
+            debug.event(f"BUY failed {market.slug} {side} @ {buy_price}: {exc}")
         except Exception as exc:
-            log.exception("limit place UNEXPECTED %s %s @ %s: %s",
-                          market.slug, side, limit_price, exc)
+            self.buys_placed.discard(key)
+            log.exception("buy UNEXPECTED %s %s @ %s: %s",
+                          market.slug, side, buy_price, exc)
+
+    async def _cancel_buys_at_open(self, m: CryptoMarket) -> None:
+        """Wait until the window opens (+ small grace period), then cancel
+        any unfilled BUY orders for this slug."""
+        wait_until = m.window_ts + CANCEL_BUYS_AT_OPEN_DELAY
+        wait = wait_until - time.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+        order_ids = self.buy_orders_by_slug.get(m.slug, [])
+        if not order_ids:
+            return
+        debug.event(f"cancelling {len(order_ids)} unfilled BUYs for {m.slug}")
+        # Fire all cancels concurrently
+        tasks = [self.executor.cancel_order(oid) for oid in order_ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        cancelled = sum(1 for r in results if r is True)
+        debug.event(f"cancelled {cancelled}/{len(order_ids)} BUYs for {m.slug}")
+        # Clear the list — anything that fills after this point can't be cancelled
+        # because Polymarket will reject cancel on filled orders (which is fine).
+        self.buy_orders_by_slug.pop(m.slug, None)
+
+    async def _handle_fill(self, fill_msg: dict) -> None:
+        """Called when user-channel WS pushes a trade event indicating a fill.
+        If the fill was on one of our BUY orders, immediately place the
+        corresponding SELL @ LIMIT_SELL_PRICE."""
+        try:
+            order_id = str(fill_msg.get("order_id") or fill_msg.get("orderID") or
+                           fill_msg.get("maker_order_id") or "")
+            if not order_id:
+                return
+            if order_id in self.sells_placed_for_order:
+                return  # already responded
+
+            # Was this one of OUR buy orders?
+            slug_match = None
+            for slug, ids in self.buy_orders_by_slug.items():
+                if order_id in ids:
+                    slug_match = slug
+                    break
+            if not slug_match:
+                # Not one of our tracked buys — could be a sell filling, or
+                # an order from before bot restart. Ignore.
+                return
+
+            market = self.markets.get(slug_match)
+            if market is None:
+                return
+
+            # Determine side from token ID in the fill message
+            token_id = str(fill_msg.get("asset_id") or fill_msg.get("token_id") or "")
+            side = None
+            if token_id == market.up_token_id:
+                side = "UP"
+            elif token_id == market.down_token_id:
+                side = "DOWN"
+            if side is None:
+                return
+
+            # Get filled size
+            try:
+                shares_filled = float(fill_msg.get("size") or
+                                      fill_msg.get("matched_amount") or 0)
+            except (TypeError, ValueError):
+                shares_filled = 0.0
+            if shares_filled < 1.0:
+                # Polymarket min order is 5 shares. Below 1 likely a partial
+                # we should aggregate, but for simplicity we skip here.
+                return
+
+            self.sells_placed_for_order.add(order_id)
+            debug.event(f"FILL detected {slug_match} {side} order={order_id[:16]}… "
+                        f"({shares_filled:.4f} sh) — placing SELL @ {LIMIT_SELL_PRICE}")
+
+            try:
+                result = await self.executor.place_limit_sell(
+                    market=market, side=side,
+                    shares=shares_filled, limit_price=LIMIT_SELL_PRICE,
+                )
+                debug.event(f"SELL placed {slug_match} {side} @ {LIMIT_SELL_PRICE} "
+                            f"({shares_filled:.4f} sh, id={result.get('order_id')})")
+            except ExecutionError as exc:
+                debug.event(f"SELL failed {slug_match} {side}: {exc}")
+            except Exception as exc:
+                log.exception("sell UNEXPECTED %s %s: %s", slug_match, side, exc)
+        except Exception as exc:
+            log.exception("fill handler error: %s", exc)
 
 
     async def websocket_loop(self) -> None:
         backoff = 1.0
         while True:
             try:
-                while not self.token_lookup:
-                    await asyncio.sleep(1)
-
+                # Don't block on empty token list — we want to receive new_market
+                # events even before we have any markets yet.
                 token_ids = list(self.token_lookup.keys())
                 debug.connect_count += 1
                 debug.last_ws_connect_at = time.time()
@@ -949,8 +1277,13 @@ class Bot:
                     close_timeout=5,
                 ) as ws:
                     backoff = 1.0
-                    # Polymarket CLOB market WS subscribe shape
-                    sub_msg = {"assets_ids": token_ids, "type": "market"}
+                    # Polymarket CLOB market WS subscribe shape.
+                    # custom_feature_enabled=true unlocks new_market and best_bid_ask events.
+                    sub_msg = {
+                        "assets_ids": token_ids,
+                        "type": "market",
+                        "custom_feature_enabled": True,
+                    }
                     sub_raw = json.dumps(sub_msg)
                     await ws.send(sub_raw)
                     debug.ws_msg(sub_raw, kind="sub")
@@ -1001,7 +1334,13 @@ class Bot:
                     self._handle_book_snapshot(m)
                 elif event_type == "price_change":
                     self._handle_price_change(m)
-                elif event_type in ("last_trade_price", "tick_size_change", ""):
+                elif event_type == "new_market":
+                    # NEW: Polymarket pushes this when a market is created.
+                    # Includes clob_token_ids — we can place orders immediately
+                    # without waiting for Gamma to index.
+                    asyncio.create_task(self._handle_new_market(m))
+                elif event_type in ("last_trade_price", "tick_size_change",
+                                    "best_bid_ask", "market_resolved", ""):
                     pass
                 else:
                     debug.unknown_event_types[event_type] = (
@@ -1069,6 +1408,85 @@ class Bot:
                 continue
             market, side = self.token_lookup[token_id]
             await self._maybe_buy(market, side, ask)
+
+    async def user_ws_loop(self) -> None:
+        """Connect to the user-channel WS to track fills on our orders.
+        When a BUY fills, _handle_fill places the corresponding SELL.
+        Auth is the same API creds used for placing orders."""
+        if not is_live_mode():
+            log.info("user_ws_loop: dry-run mode, skipping fill tracking")
+            return
+
+        url = CLOB_WS_URL.replace("/ws/market", "/ws/user")
+        backoff = 1.0
+        while True:
+            try:
+                # Get API creds — only available on the live executor after first use.
+                # If executor isn't initialized yet, force it.
+                if isinstance(self.executor, LivePolymarketExecutor):
+                    if self.executor.client is None:
+                        self.executor._ensure_client()
+                    client = self.executor.client
+                else:
+                    log.info("user_ws_loop: not live executor, skipping")
+                    return
+
+                # The user WS subscription needs auth + condition IDs to subscribe.
+                # We subscribe to ALL conditions we know about.
+                conditions = list({m.condition_id for m in self.markets.values()
+                                   if m.condition_id})
+                if not conditions:
+                    await asyncio.sleep(2)
+                    continue
+
+                # Build auth payload from API creds
+                creds = getattr(client, "creds", None) or getattr(client, "api_creds", None)
+                api_key = getattr(creds, "api_key", None)
+                api_secret = getattr(creds, "api_secret", None)
+                api_passphrase = (getattr(creds, "api_passphrase", None)
+                                  or getattr(creds, "passphrase", None))
+                if not (api_key and api_secret and api_passphrase):
+                    debug.event("user_ws: missing API creds, retrying in 5s")
+                    await asyncio.sleep(5)
+                    continue
+
+                debug.event(f"user_ws connecting (subscribing to {len(conditions)} conditions)")
+                async with websockets.connect(url, ping_interval=10, ping_timeout=5,
+                                              close_timeout=5) as ws:
+                    backoff = 1.0
+                    sub_msg = {
+                        "auth": {
+                            "apiKey": api_key,
+                            "secret": api_secret,
+                            "passphrase": api_passphrase,
+                        },
+                        "markets": conditions,
+                        "type": "user",
+                    }
+                    await ws.send(json.dumps(sub_msg))
+                    debug.event(f"user_ws subscribed to {len(conditions)} markets")
+
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        messages = msg if isinstance(msg, list) else [msg]
+                        for m in messages:
+                            if not isinstance(m, dict):
+                                continue
+                            etype = (m.get("event_type") or m.get("type") or "").lower()
+                            if etype == "trade":
+                                await self._handle_fill(m)
+                            elif etype == "order":
+                                # Order state change — could include fills via match_count
+                                status = str(m.get("status", "")).lower()
+                                if status in ("matched", "filled", "partial_fill"):
+                                    await self._handle_fill(m)
+            except Exception as exc:
+                debug.event(f"user_ws error: {exc} — backoff {backoff:.1f}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
     async def resolution_loop(self) -> None:
         while True:
@@ -1232,7 +1650,10 @@ class Bot:
                     "coins": COINS,
                     "threshold": ENTRY_THRESHOLD,           # back-compat: lowest rung
                     "thresholds": ENTRY_THRESHOLDS,          # full ladder
-                    "limit_prices": LIMIT_PRICES,            # for STRATEGY=limits
+                    "limit_prices": LIMIT_PRICES,            # legacy: for STRATEGY=limits old style
+                    "limit_buy_prices": LIMIT_BUY_PRICES,    # pre-market BUY ladder
+                    "limit_sell_price": LIMIT_SELL_PRICE,    # SELL price after BUY fill
+                    "cancel_buys_at_open_delay": CANCEL_BUYS_AT_OPEN_DELAY,
                     "max_price": ENTRY_MAX_PRICE,
                     "stake_usd": POSITION_SIZE_USD,
                     "min_seconds_remaining": MIN_SECONDS_REMAINING,
@@ -1298,8 +1719,11 @@ class Bot:
         log.info("  strategy:  %s", STRATEGY.upper())
         log.info("  coins:     %s", ",".join(COINS))
         if STRATEGY == "limits":
-            log.info("  limits:    %s @ $%.2f each (4 orders/market)",
-                     LIMIT_PRICES, POSITION_SIZE_USD)
+            log.info("  buy ladder: %s @ $%.2f (UP+DOWN, %d orders/market)",
+                     LIMIT_BUY_PRICES, POSITION_SIZE_USD, 2 * len(LIMIT_BUY_PRICES))
+            log.info("  sell on fill at: %.2f", LIMIT_SELL_PRICE)
+            log.info("  cancel unfilled buys: %ds after window open",
+                     CANCEL_BUYS_AT_OPEN_DELAY)
         else:
             log.info("  threshold: ladder %s, max %.2f", ENTRY_THRESHOLDS, ENTRY_MAX_PRICE)
             log.info("  size:      $%.2f", POSITION_SIZE_USD)
@@ -1310,6 +1734,7 @@ class Bot:
             await asyncio.gather(
                 self.discovery_loop(),
                 self.websocket_loop(),
+                self.user_ws_loop(),
                 self.resolution_loop(),
                 self.status_loop(),
                 self.healthcheck_server(),
