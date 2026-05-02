@@ -831,27 +831,27 @@ class Bot:
         self.start_time = time.time()
 
     async def discovery_loop(self) -> None:
-        """Sleep until each 5-min boundary + 100ms, then place orders.
-        Skip the currently-in-progress window on startup — only trade fresh
-        windows where we can catch market open."""
-        log.info("discovery: waiting for next 5-min boundary")
+        """Start polling 10s BEFORE each 5-min boundary. Polymarket may
+        publish the new slug early — if so, place orders before open and
+        they rest in the book ready to fill at market open. If the slug
+        isn't available yet, retry every 200ms until it appears or 13s
+        after boundary (3s post-open timeout)."""
+        log.info("discovery: waiting for next pre-open window (10s early)")
 
         while True:
             try:
-                # Compute next boundary
+                # Wake 10s BEFORE next boundary
                 now = time.time()
                 next_boundary = ((int(now) // 300) + 1) * 300
-                # Wake 100ms after boundary to give Gamma time to publish
-                wake_at = next_boundary + 0.1
+                wake_at = next_boundary - 10
                 wait = wake_at - now
                 if wait > 0:
                     await asyncio.sleep(wait)
 
-                window = next_boundary  # this is the slug timestamp
-                wake_actual = time.time()
-                debug.event(f"boundary tick: {window} (woke {(wake_actual-next_boundary)*1000:.0f}ms after open)")
+                window = next_boundary  # slug timestamp = boundary
+                debug.event(f"pre-open polling for window {window}")
 
-                # Expire any old markets
+                # Expire old markets
                 expired_slugs = [s for s, m in list(self.markets.items())
                                  if m.window_ts < window]
                 for s in expired_slugs:
@@ -862,8 +862,9 @@ class Bot:
                         self.token_lookup.pop(m.up_token_id, None)
                         self.token_lookup.pop(m.down_token_id, None)
 
-                # Fetch all coins for this new window. Retry up to 3s.
-                deadline = time.time() + 3.0
+                # Poll until each coin's slug exists or 13s past boundary
+                # (10s pre + 3s post-open grace = 13s window of attempts)
+                deadline = next_boundary + 3.0
                 pending_coins = list(COINS)
                 attempt = 0
                 while pending_coins and time.time() < deadline:
@@ -882,12 +883,11 @@ class Bot:
                         await self._on_market_discovered(m, attempt=attempt)
                     pending_coins = next_pending
                     if pending_coins:
-                        await asyncio.sleep(0.05)
+                        await asyncio.sleep(0.2)  # 200ms between retries
 
                 if pending_coins:
                     debug.event(f"timed out waiting for: {pending_coins}")
 
-                # Trigger WS resubscribe if anything changed
                 self.subscription_changed.set()
 
             except Exception as exc:
