@@ -1572,21 +1572,37 @@ class Bot:
         of our markets/sides this event affects, places SELL on fills, and
         triggers merge when both UP and DOWN are held."""
         try:
-            # The event may be a trade or order lifecycle. Either way, find the
-            # token_id of the asset that was matched.
+            # CRITICAL: Polymarket sends the same fill multiple times — first
+            # as a `trade` event with status=matched, then `order` events as
+            # state evolves (matched → mined → confirmed). Dedupe by trade_id
+            # so we don't place 5 sells for one fill.
+            trade_id = str(ev.get("id") or ev.get("trade_id")
+                           or ev.get("transaction_hash") or "")
+            if trade_id:
+                if not hasattr(self, "_seen_trade_ids"):
+                    self._seen_trade_ids: set[str] = set()
+                if trade_id in self._seen_trade_ids:
+                    return  # duplicate
+                self._seen_trade_ids.add(trade_id)
+
+            # Log the raw event the FIRST time we see this fill, so we can debug
+            # field names (asset_id vs token_id vs maker_asset_id, etc.)
+            log.info("user_ws raw event: %s", json.dumps(ev)[:600])
+
+            # Find token_id from various possible field names
             token_id = str(ev.get("asset_id") or ev.get("token_id")
                            or ev.get("maker_asset_id") or ev.get("taker_asset_id") or "")
             if not token_id or token_id not in self.token_lookup:
-                # Not one of our tracked markets
+                log.info("user_ws event: token_id=%s not in tracked markets", token_id[:16])
                 return
 
             market, side = self.token_lookup[token_id]
 
             # Determine the side of the fill — only act on BUY fills
             ev_side = str(ev.get("side", "")).lower()
-            # On user channel, side is from our perspective. BUY fill → we received shares.
             if ev_side and ev_side != "buy":
-                return  # we don't auto-action on sells/own sells filling
+                log.info("user_ws event: not a BUY (side=%s), skipping", ev_side)
+                return
 
             # Get filled size — try common field names
             shares_filled = 0.0
@@ -1600,10 +1616,11 @@ class Bot:
                     except (TypeError, ValueError):
                         pass
             if shares_filled < 1.0:
-                # Could be 0 from a partial event we already processed
+                log.info("user_ws event: no usable size (got %.4f), skipping", shares_filled)
                 return
 
-            log.info("FILL %s %s: %.4f sh from event", market.slug, side, shares_filled)
+            log.info("FILL ws %s %s: %.4f sh — placing SELL @ %s",
+                     market.slug, side, shares_filled, LIMIT_SELL_PRICE)
             debug.event(f"FILL ws {market.slug} {side} ({shares_filled:.4f} sh)")
 
             # 1) Place SELL @ LIMIT_SELL_PRICE for these new shares
@@ -1614,13 +1631,17 @@ class Bot:
                     market=market, side=side,
                     shares=shares_filled, limit_price=LIMIT_SELL_PRICE,
                 )
+                log.info("SELL placed %s %s @ %s (%.4f sh, id=%s)",
+                         market.slug, side, LIMIT_SELL_PRICE, shares_filled,
+                         result.get('order_id'))
                 debug.event(f"SELL placed {market.slug} {side} @ {LIMIT_SELL_PRICE} "
                             f"({shares_filled:.4f} sh, id={result.get('order_id')})")
             except ExecutionError as exc:
+                log.error("SELL FAILED %s %s: %s", market.slug, side, exc)
                 debug.event(f"SELL failed {market.slug} {side}: {exc}")
                 self.shares_sold_for_token[token_id] = sold_already  # rollback
             except Exception as exc:
-                log.exception("sell placement error: %s", exc)
+                log.exception("SELL UNEXPECTED ERROR %s %s: %s", market.slug, side, exc)
                 self.shares_sold_for_token[token_id] = sold_already
 
             # 2) MERGE: if we now hold BOTH UP and DOWN shares for this slug,
