@@ -1015,29 +1015,27 @@ class Bot:
         self.markets_initialized: set[str] = set()
 
     async def discovery_loop(self) -> None:
-        """Start polling 10s BEFORE each 5-min boundary. Polymarket may
-        publish the new slug early — if so, place orders before open and
-        they rest in the book ready to fill at market open. If the slug
-        isn't available yet, retry every 200ms until it appears or 13s
-        after boundary (3s post-open timeout)."""
-        log.info("discovery: waiting for next pre-open window (10s early)")
+        """Always work on the NEXT market (the one after current window).
+        The next market already exists on Polymarket the moment the current
+        one starts, so we can fetch it and place the buy ladder immediately —
+        giving us up to 5 minutes of pre-market resting orders.
+
+        Loop logic: every 30 seconds, ensure we have the upcoming window
+        loaded. When boundaries cross, the upcoming becomes current, and the
+        loop discovers the next-upcoming."""
+        log.info("discovery: continuous next-window discovery (5min lookahead)")
 
         while True:
             try:
-                # Wake 10s BEFORE next boundary
                 now = time.time()
-                next_boundary = ((int(now) // 300) + 1) * 300
-                wake_at = next_boundary - 10
-                wait = wake_at - now
-                if wait > 0:
-                    await asyncio.sleep(wait)
+                # The "current" window is the one we're inside right now
+                current_window = (int(now) // 300) * 300
+                # The "next" window is the one after current
+                next_window = current_window + 300
 
-                window = next_boundary  # slug timestamp = boundary
-                debug.event(f"pre-open polling for window {window}")
-
-                # Expire old markets
+                # Expire markets older than current
                 expired_slugs = [s for s, m in list(self.markets.items())
-                                 if m.window_ts < window]
+                                 if m.window_ts < current_window]
                 for s in expired_slugs:
                     m = self.markets.pop(s, None)
                     if m:
@@ -1046,37 +1044,45 @@ class Bot:
                         self.token_lookup.pop(m.up_token_id, None)
                         self.token_lookup.pop(m.down_token_id, None)
 
-                # Poll until each coin's slug exists or 13s past boundary
-                # (10s pre + 3s post-open grace = 13s window of attempts)
-                deadline = next_boundary + 3.0
-                pending_coins = list(COINS)
-                attempt = 0
-                while pending_coins and time.time() < deadline:
-                    attempt += 1
-                    results = await asyncio.gather(
-                        *(fetch_market(self.client, c, window) for c in pending_coins),
-                        return_exceptions=True,
-                    )
-                    next_pending = []
-                    for c, m in zip(pending_coins, results):
-                        if isinstance(m, Exception) or m is None:
-                            next_pending.append(c)
+                # Discover BOTH windows in parallel: the currently-running one
+                # (in case we just started up) AND the next one (for pre-market
+                # ladder placement). Idempotent — _on_market_discovered skips
+                # already-initialized slugs.
+                target_windows = [current_window, next_window]
+                tasks = []
+                for window in target_windows:
+                    for coin in COINS:
+                        # Skip coins where we already have a market for this window
+                        slug_expected = f"{coin}-updown-5m-{window}"
+                        if slug_expected in self.markets_initialized:
                             continue
-                        if m.slug in self.markets:
-                            continue
-                        await self._on_market_discovered(m, attempt=attempt)
-                    pending_coins = next_pending
-                    if pending_coins:
-                        await asyncio.sleep(0.2)  # 200ms between retries
+                        tasks.append((coin, window,
+                                      fetch_market(self.client, coin, window)))
 
-                if pending_coins:
-                    debug.event(f"timed out waiting for: {pending_coins}")
+                if tasks:
+                    results = await asyncio.gather(
+                        *(t[2] for t in tasks), return_exceptions=True,
+                    )
+                    for (coin, window, _), m in zip(tasks, results):
+                        if isinstance(m, Exception) or m is None:
+                            continue
+                        if m.slug in self.markets_initialized:
+                            continue
+                        await self._on_market_discovered(m, attempt=1)
 
                 self.subscription_changed.set()
 
+                # Sleep until either:
+                # (a) the next-window slug should exist (next boundary - 30s)
+                # (b) at most 30s, so we don't drift if Polymarket is slow
+                now2 = time.time()
+                sleep_until = min(next_window - 30, now2 + 30)
+                wait = max(1.0, sleep_until - now2)
+                await asyncio.sleep(wait)
+
             except Exception as exc:
                 log.exception("discovery error: %s", exc)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(5.0)
 
     async def _on_market_discovered(self, m: CryptoMarket, attempt: int) -> None:
         """Called when a market is found via Gamma poll. Registers it and (if
@@ -1121,16 +1127,16 @@ class Bot:
             if slug in self.markets_initialized:
                 return  # already handled by Gamma poll
 
-            # CRITICAL FILTER: Polymarket pre-creates 5m markets hours/days
-            # ahead. Only act on the *next* upcoming window, not future ones.
-            # Accept windows from now up to 5 minutes out.
+            # Filter: Polymarket pre-creates 5m markets hours/days ahead. Only act
+            # on the current or next-upcoming window. 600s = 10min covers current
+            # plus the immediately-upcoming window with margin.
             now = time.time()
             secs_until_open = window_ts - now
-            if secs_until_open > 300:
-                # Too far in the future — Polymarket bulk-publishes future markets
+            if secs_until_open > 600:
+                # Too far in the future — Polymarket bulk-publishing
                 return
             if secs_until_open < -60:
-                # Too far in the past — window already running for >1 minute
+                # Too far in the past
                 return
 
             token_ids = msg.get("clob_token_ids") or msg.get("assets_ids") or []
