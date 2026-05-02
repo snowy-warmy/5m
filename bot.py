@@ -54,7 +54,29 @@ except Exception:
 
 
 COINS = [c.strip().lower() for c in _env("COINS", "btc").split(",") if c.strip()]
-ENTRY_THRESHOLD = _env("ENTRY_THRESHOLD", 0.65, float)
+
+# ENTRY_THRESHOLD: comma-separated ladder, e.g. "0.40,0.60" → 2 entries per side.
+# Single value like "0.58" still works (1 entry per side).
+def _parse_thresholds(raw: str) -> list[float]:
+    out = []
+    for tok in str(raw).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            v = float(tok)
+            if 0 < v < 1:
+                out.append(v)
+        except ValueError:
+            pass
+    return sorted(set(out))
+
+_THRESHOLD_RAW = os.environ.get("ENTRY_THRESHOLD", "0.65")
+ENTRY_THRESHOLDS = _parse_thresholds(_THRESHOLD_RAW) or [0.65]
+# Back-compat: keep ENTRY_THRESHOLD as the LOWEST rung for any code that
+# might still reference it.
+ENTRY_THRESHOLD = ENTRY_THRESHOLDS[0]
+
 ENTRY_MAX_PRICE = _env("ENTRY_MAX_PRICE", 0.97, float)
 POSITION_SIZE_USD = _env("POSITION_SIZE_USD", 1.0, float)
 
@@ -673,11 +695,11 @@ class Bot:
         self.markets: dict[str, CryptoMarket] = {}
         self.books: dict[str, TokenBook] = {}
         self.token_lookup: dict[str, tuple[CryptoMarket, str]] = {}
-        self.triggered: set[tuple[str, str]] = set()
-        # Set of (slug, side) where we've observed the ask BELOW threshold.
-        # Required before we'll allow a trigger — prevents firing on the
-        # first WS snapshot of a stale window where ask is already 0.85+.
-        self.seen_below: set[tuple[str, str]] = set()
+        # Per-rung trigger tracking: (slug, side, rung_idx) → fired
+        self.triggered: set[tuple[str, str, int]] = set()
+        # Per-rung seen-below tracking. Each rung needs its own confirmation
+        # that the ask was below it before allowing trigger.
+        self.seen_below: set[tuple[str, str, int]] = set()
         self.subscription_changed = asyncio.Event()
         self.start_time = time.time()
 
@@ -693,10 +715,11 @@ class Bot:
                         self.books.pop(m.down_token_id, None)
                         self.token_lookup.pop(m.up_token_id, None)
                         self.token_lookup.pop(m.down_token_id, None)
-                        self.triggered.discard((m.slug, "UP"))
-                        self.triggered.discard((m.slug, "DOWN"))
-                        self.seen_below.discard((m.slug, "UP"))
-                        self.seen_below.discard((m.slug, "DOWN"))
+                        # Clear all rung-level state for this slug
+                        for side in ("UP", "DOWN"):
+                            for ri in range(len(ENTRY_THRESHOLDS)):
+                                self.triggered.discard((m.slug, side, ri))
+                                self.seen_below.discard((m.slug, side, ri))
                 if expired:
                     debug.event(f"expired {len(expired)} window(s)")
 
@@ -915,63 +938,61 @@ class Bot:
                 pass
             await asyncio.sleep(60)
 
-    def _entry_blocked(self, market: CryptoMarket, side: str) -> Optional[str]:
+    def _entry_blocked(self, market: CryptoMarket, side: str,
+                       rung_idx: int) -> Optional[str]:
         if KILL_SWITCH:
             return "kill_switch"
         if market.seconds_left() < MIN_SECONDS_REMAINING:
             return f"window_too_late ({market.seconds_left()}s)"
-        if (market.slug, side) in self.triggered:
+        if (market.slug, side, rung_idx) in self.triggered:
             return "already_triggered"
         cap = MAX_CONCURRENT_POSITIONS
         if cap > 0 and self.persistence.open_count() >= cap:
             return f"max_concurrent ({cap})"
-        if self.persistence.has_open_for_slug_side(market.slug, side):
-            return "duplicate"
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.persistence.daily_pnl(day) <= -abs(MAX_DAILY_LOSS_USD):
             return f"daily_loss_cap ({MAX_DAILY_LOSS_USD})"
         return None
 
     async def _maybe_buy(self, market: CryptoMarket, side: str, ask: float) -> None:
-        if ask < ENTRY_THRESHOLD or ask > ENTRY_MAX_PRICE:
-            # Mark that we've seen this side below threshold — required
-            # before any future trigger is allowed for this (slug, side).
-            if ask < ENTRY_THRESHOLD:
-                self.seen_below.add((market.slug, side))
+        if ask > ENTRY_MAX_PRICE:
             return
 
-        # FIX: only trigger if we previously observed this side below threshold.
-        # Otherwise the first WS snapshot of a stale window (ask already 0.85+)
-        # would fire instantly on resolved markets.
-        if (market.slug, side) not in self.seen_below:
-            return
+        # Update seen_below tracking for every rung whose threshold is above ask
+        for ri, T in enumerate(ENTRY_THRESHOLDS):
+            if ask < T:
+                self.seen_below.add((market.slug, side, ri))
 
-        block = self._entry_blocked(market, side)
-        if block:
-            return
+        # Check each rung in order. Fire any that have crossed.
+        for ri, T in enumerate(ENTRY_THRESHOLDS):
+            if ask < T:
+                continue  # ask hasn't reached this rung yet
+            # Require we've seen this rung's ask below T at some point
+            if (market.slug, side, ri) not in self.seen_below:
+                continue
+            block = self._entry_blocked(market, side, ri)
+            if block:
+                continue
 
-        # Lock IMMEDIATELY before any await — prevents re-entry from
-        # rapid book updates while the order is in flight.
-        self.triggered.add((market.slug, side))
-        debug.event(f"TRIGGER {market.slug} {side} ask={ask:.4f}")
+            # Lock immediately before await
+            self.triggered.add((market.slug, side, ri))
+            debug.event(f"TRIGGER {market.slug} {side} rung{ri+1}@{T} ask={ask:.4f}")
 
-        try:
-            pos = await self.executor.buy(
-                market=market, side=side,
-                size_usd=POSITION_SIZE_USD, ask_price=ask,
-            )
-        except ExecutionError as exc:
-            # FIX: keep the trigger lock on failure. Better to miss a retry
-            # than to double-fill if the order actually matched after we gave up.
-            debug.event(f"buy FAILED {market.slug} {side}: {exc} (lock kept)")
-            return
-        except Exception as exc:
-            log.exception("buy UNEXPECTED %s %s: %s", market.slug, side, exc)
-            return
+            try:
+                pos = await self.executor.buy(
+                    market=market, side=side,
+                    size_usd=POSITION_SIZE_USD, ask_price=ask,
+                )
+            except ExecutionError as exc:
+                debug.event(f"buy FAILED {market.slug} {side} rung{ri+1}: {exc} (lock kept)")
+                continue
+            except Exception as exc:
+                log.exception("buy UNEXPECTED %s %s rung%d: %s", market.slug, side, ri, exc)
+                continue
 
-        pos_id = self.persistence.record_position_open(pos)
-        debug.event(f"ENTERED #{pos_id} {side} {market.slug} @ {pos.entry_price:.4f} "
-                    f"({pos.shares:.4f} shares, {market.seconds_left()}s left)")
+            pos_id = self.persistence.record_position_open(pos)
+            debug.event(f"ENTERED #{pos_id} {side} rung{ri+1} {market.slug} @ {pos.entry_price:.4f} "
+                        f"({pos.shares:.4f} shares, {market.seconds_left()}s left)")
 
     async def healthcheck_server(self) -> None:
         try:
@@ -991,6 +1012,11 @@ class Bot:
             for slug, m in bot.markets.items():
                 up_book = bot.books.get(m.up_token_id)
                 dn_book = bot.books.get(m.down_token_id)
+                # Per-rung trigger state: "✓✓" if all fired, "✓·" if only first, etc.
+                up_trig = [(slug, "UP", ri) in bot.triggered
+                           for ri in range(len(ENTRY_THRESHOLDS))]
+                dn_trig = [(slug, "DOWN", ri) in bot.triggered
+                           for ri in range(len(ENTRY_THRESHOLDS))]
                 current[slug] = {
                     "coin": m.coin,
                     "seconds_left": m.seconds_left(),
@@ -1000,8 +1026,12 @@ class Bot:
                     "down_ask": dn_book.best_ask() if dn_book else None,
                     "down_bid": dn_book.best_bid() if dn_book else None,
                     "down_levels": len(dn_book.asks) if dn_book else 0,
-                    "triggered_up": (slug, "UP") in bot.triggered,
-                    "triggered_down": (slug, "DOWN") in bot.triggered,
+                    # Back-compat fields (any rung fired = true)
+                    "triggered_up": any(up_trig),
+                    "triggered_down": any(dn_trig),
+                    # New per-rung fields
+                    "triggered_up_rungs": up_trig,
+                    "triggered_down_rungs": dn_trig,
                 }
             ws_age = ((time.time() - debug.last_ws_message_at)
                       if debug.last_ws_message_at else None)
@@ -1012,7 +1042,8 @@ class Bot:
                 "live_mode": is_live_mode(),
                 "config": {
                     "coins": COINS,
-                    "threshold": ENTRY_THRESHOLD,
+                    "threshold": ENTRY_THRESHOLD,           # back-compat: lowest rung
+                    "thresholds": ENTRY_THRESHOLDS,          # full ladder
                     "max_price": ENTRY_MAX_PRICE,
                     "stake_usd": POSITION_SIZE_USD,
                     "min_seconds_remaining": MIN_SECONDS_REMAINING,
@@ -1076,7 +1107,7 @@ class Bot:
         log.info("─" * 60)
         log.info("Polymarket 5m crypto WS-ask bot (with /debug)")
         log.info("  coins:     %s", ",".join(COINS))
-        log.info("  threshold: ask >= %.2f and <= %.2f", ENTRY_THRESHOLD, ENTRY_MAX_PRICE)
+        log.info("  threshold: ladder %s, max %.2f", ENTRY_THRESHOLDS, ENTRY_MAX_PRICE)
         log.info("  size:      $%.2f", POSITION_SIZE_USD)
         log.info("  mode:      %s", "LIVE" if is_live_mode() else "DRY-RUN")
         log.info("─" * 60)
