@@ -1,56 +1,51 @@
-# Fly.io config — adjust app name and region before first deploy.
-# Run: fly launch --no-deploy --copy-config
-#      fly volume create poly5m_data --size 1 --region ams
-#      fly secrets set POLY_PRIVATE_KEY=0x... POLY_FUNDER=0x...
-#      fly deploy
+# fly.toml app configuration file generated for 5m555 on 2026-05-02T00:03:32Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "poly5m-bot"
-primary_region = "ams"
+app = '5m555'
+primary_region = 'bom'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  COINS = "btc,eth,xrp,doge,hype,bnb,sol"
-  ENTRY_THRESHOLD = "0.58"
-  ENTRY_MAX_PRICE = "0.97"
-  POSITION_SIZE_USD = "1.0"
-  MIN_SECONDS_REMAINING = "20"
+  ARMED_FOR_LIVE = 'false'
+  COINS = 'btc,eth,xrp,doge,hype,bnb,sol'
+  DB_PATH = '/data/bot.sqlite3'
+  DRY_RUN = 'true'
+  ENTRY_MAX_PRICE = '0.97'
+  ENTRY_THRESHOLD = '0.58'
+  HEALTHCHECK_PORT = '8080'
+  KILL_SWITCH = 'false'
+  LOG_LEVEL = 'INFO'
+  MAX_CONCURRENT_POSITIONS = '20'
+  MAX_DAILY_LOSS_USD = '50.0'
+  MIN_SECONDS_REMAINING = '20'
+  POLY_AUTO_DERIVE_CREDS = 'true'
+  POLY_SIGNATURE_TYPE = '2'
+  POSITION_SIZE_USD = '1.0'
+  TRADING_ENABLED = 'false'
 
-  MAX_CONCURRENT_POSITIONS = "20"
-  MAX_DAILY_LOSS_USD = "50.0"
-  KILL_SWITCH = "false"
-
-  DRY_RUN = "true"
-  TRADING_ENABLED = "false"
-  ARMED_FOR_LIVE = "false"
-
-  POLY_SIGNATURE_TYPE = "2"
-  POLY_AUTO_DERIVE_CREDS = "true"
-
-  DB_PATH = "/data/bot.sqlite3"
-  HEALTHCHECK_PORT = "8080"
-  LOG_LEVEL = "INFO"
-
-[mounts]
-  source = "poly5m_data"
-  destination = "/data"
+[[mounts]]
+  source = 'poly5m_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
 
   [[http_service.checks]]
-    grace_period = "10s"
-    interval = "30s"
-    method = "GET"
-    path = "/healthz"
-    timeout = "5s"
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/healthz'
 
 [[vm]]
-  cpu_kind = "shared"
+  cpu_kind = 'shared'
   cpus = 1
   memory_mb = 512
