@@ -978,36 +978,71 @@ class LivePolymarketExecutor(BaseExecutor):
 
     def _cancel_sync(self, order_id: str) -> bool:
         self._ensure_client()
-        try:
-            # V2 SDK uses cancel_order(order_id=...). Some versions accept just
-            # a positional arg or use bulk cancel_orders.
-            result = None
-            for attempt_method in ("cancel_order", "cancel_orders"):
-                if hasattr(self.client, attempt_method):
-                    method = getattr(self.client, attempt_method)
-                    if attempt_method == "cancel_orders":
-                        result = method([order_id])
-                    else:
-                        try:
-                            result = method(order_id=order_id)
-                        except TypeError:
-                            result = method(order_id)
-                    break
-            if result is None:
-                log.warning("no cancel method found on ClobClient")
-                return False
-            ts = utc_now_iso()
-            self.persistence.record_order(
-                ts=ts, action="cancel", coin="", slug="",
-                condition_id="", token_id="", side="",
-                price=0.0, size_usd=0.0, shares=0.0,
-                status="cancelled", order_id=order_id,
-                payload={"result": result if isinstance(result, dict) else str(result)},
-            )
-            return True
-        except Exception as exc:
-            log.warning("cancel failed for %s: %s", order_id, exc)
-            return False
+        # Diagnostic: log available methods on first call
+        if not getattr(self, "_logged_cancel_methods", False):
+            self._logged_cancel_methods = True
+            methods = [m for m in dir(self.client) if "cancel" in m.lower()
+                       and not m.startswith("_")]
+            log.info("ClobClient cancel-related methods: %s", methods)
+
+        # The V2 SDK errors with `'str' object has no attribute 'orderID'`
+        # which means cancel_order expects an OBJECT. Try several approaches:
+        # 1) Fetch the order details first, then pass that object
+        # 2) Try cancel(order_id=...) for backwards compat with v1
+        # 3) Try a manual hand-rolled HTTP DELETE to /order
+
+        last_exc = None
+
+        # Attempt 1: cancel_orders (bulk) which takes a list of strings
+        if hasattr(self.client, "cancel_orders"):
+            try:
+                result = self.client.cancel_orders([order_id])
+                log.info("cancel_orders([%s…]) → %s", order_id[:12], result)
+                ts = utc_now_iso()
+                self.persistence.record_order(
+                    ts=ts, action="cancel", coin="", slug="",
+                    condition_id="", token_id="", side="",
+                    price=0.0, size_usd=0.0, shares=0.0,
+                    status="cancelled", order_id=order_id,
+                    payload={"result": result if isinstance(result, dict) else str(result),
+                             "method": "cancel_orders"},
+                )
+                # Polymarket cancel_orders returns {canceled: [...], not_canceled: {...}}
+                # Treat as success if order is in the canceled list or response is OK.
+                if isinstance(result, dict):
+                    canceled = result.get("canceled") or result.get("cancelled") or []
+                    if order_id in canceled:
+                        return True
+                    not_canceled = (result.get("not_canceled") or
+                                    result.get("not_cancelled") or {})
+                    if order_id in not_canceled:
+                        log.warning("cancel rejected: %s", not_canceled[order_id])
+                        return False
+                return True
+            except Exception as exc:
+                last_exc = exc
+                log.warning("cancel_orders failed: %s", exc)
+
+        # Attempt 2: pass order_id positionally (some SDKs do that)
+        if hasattr(self.client, "cancel_order"):
+            try:
+                result = self.client.cancel_order(order_id)
+                log.info("cancel_order(%s…) → %s", order_id[:12], result)
+                return True
+            except Exception as exc:
+                last_exc = exc
+
+        # Attempt 3: legacy cancel
+        if hasattr(self.client, "cancel"):
+            try:
+                result = self.client.cancel(order_id=order_id)
+                log.info("cancel(order_id=%s…) → %s", order_id[:12], result)
+                return True
+            except Exception as exc:
+                last_exc = exc
+
+        log.warning("all cancel methods failed for %s: %s", order_id[:12], last_exc)
+        return False
 
 
 # ─── bot ──────────────────────────────────────────────────────────────────
@@ -1236,7 +1271,14 @@ class Bot:
         await asyncio.gather(*tasks, return_exceptions=True)
         # Schedule a one-shot task to cancel any unfilled BUY orders for
         # this slug shortly after the window opens.
-        asyncio.create_task(self._cancel_buys_at_open(m))
+        secs_to_cancel = (m.window_ts + CANCEL_BUYS_AT_OPEN_DELAY) - time.time()
+        log.info("scheduled cancel for %s in %.1fs", m.slug, secs_to_cancel)
+        # Save reference so the task isn't garbage collected.
+        if not hasattr(self, "_cancel_tasks"):
+            self._cancel_tasks: set = set()
+        task = asyncio.create_task(self._cancel_buys_at_open(m))
+        self._cancel_tasks.add(task)
+        task.add_done_callback(self._cancel_tasks.discard)
 
     async def _place_one_buy(self, market: CryptoMarket, side: str,
                              buy_price: float, source: str) -> None:
@@ -1254,6 +1296,9 @@ class Bot:
             order_id = result.get("order_id")
             if order_id:
                 self.buy_orders_by_slug.setdefault(market.slug, []).append(order_id)
+            log.info("BUY placed %s %s @ %s (%.4f sh, id=%s, src=%s)",
+                     market.slug, side, buy_price, result.get('shares', 0),
+                     order_id, source)
             debug.event(f"BUY placed {market.slug} {side} @ {buy_price} "
                         f"({result.get('shares', 0):.4f} sh, id={order_id}, src={source})")
         except ExecutionError as exc:
@@ -1267,23 +1312,33 @@ class Bot:
     async def _cancel_buys_at_open(self, m: CryptoMarket) -> None:
         """Wait until the window opens (+ small grace period), then cancel
         any unfilled BUY orders for this slug."""
-        wait_until = m.window_ts + CANCEL_BUYS_AT_OPEN_DELAY
-        wait = wait_until - time.time()
-        if wait > 0:
-            await asyncio.sleep(wait)
+        try:
+            wait_until = m.window_ts + CANCEL_BUYS_AT_OPEN_DELAY
+            wait = wait_until - time.time()
+            log.info("cancel-task armed for %s, sleeping %.1fs", m.slug, wait)
+            if wait > 0:
+                await asyncio.sleep(wait)
 
-        order_ids = self.buy_orders_by_slug.get(m.slug, [])
-        if not order_ids:
-            return
-        debug.event(f"cancelling {len(order_ids)} unfilled BUYs for {m.slug}")
-        # Fire all cancels concurrently
-        tasks = [self.executor.cancel_order(oid) for oid in order_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        cancelled = sum(1 for r in results if r is True)
-        debug.event(f"cancelled {cancelled}/{len(order_ids)} BUYs for {m.slug}")
-        # Clear the list — anything that fills after this point can't be cancelled
-        # because Polymarket will reject cancel on filled orders (which is fine).
-        self.buy_orders_by_slug.pop(m.slug, None)
+            order_ids = list(self.buy_orders_by_slug.get(m.slug, []))
+            log.info("cancel-task fired for %s, %d orders to cancel",
+                     m.slug, len(order_ids))
+            if not order_ids:
+                return
+            log.info("cancelling %d unfilled BUYs for %s", len(order_ids), m.slug)
+            debug.event(f"cancelling {len(order_ids)} unfilled BUYs for {m.slug}")
+            tasks = [self.executor.cancel_order(oid) for oid in order_ids]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            cancelled = sum(1 for r in results if r is True)
+            log.info("cancelled %d/%d BUYs for %s", cancelled, len(order_ids), m.slug)
+            for oid, r in zip(order_ids, results):
+                if isinstance(r, Exception):
+                    log.warning("cancel exception %s: %s", oid[:12], r)
+                elif r is not True:
+                    log.warning("cancel returned %s for %s", r, oid[:12])
+            debug.event(f"cancelled {cancelled}/{len(order_ids)} BUYs for {m.slug}")
+            self.buy_orders_by_slug.pop(m.slug, None)
+        except Exception as exc:
+            log.exception("cancel task crashed for %s: %s", m.slug, exc)
 
     async def _handle_fill(self, fill_msg: dict) -> None:
         """Called when user-channel WS pushes a trade event indicating a fill.
