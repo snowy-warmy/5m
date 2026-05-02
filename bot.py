@@ -1121,6 +1121,18 @@ class Bot:
             if slug in self.markets_initialized:
                 return  # already handled by Gamma poll
 
+            # CRITICAL FILTER: Polymarket pre-creates 5m markets hours/days
+            # ahead. Only act on the *next* upcoming window, not future ones.
+            # Accept windows from now up to 5 minutes out.
+            now = time.time()
+            secs_until_open = window_ts - now
+            if secs_until_open > 300:
+                # Too far in the future — Polymarket bulk-publishes future markets
+                return
+            if secs_until_open < -60:
+                # Too far in the past — window already running for >1 minute
+                return
+
             token_ids = msg.get("clob_token_ids") or msg.get("assets_ids") or []
             if len(token_ids) < 2:
                 debug.event(f"new_market {slug} missing token_ids: {msg}")
@@ -1145,7 +1157,6 @@ class Bot:
             self.token_lookup[m.down_token_id] = (m, "DOWN")
             self.subscription_changed.set()
 
-            secs_until_open = window_ts - time.time()
             debug.event(f"NEW_MARKET ws-event {slug} ({secs_until_open:+.1f}s to open) "
                         f"— firing pre-market orders")
 
@@ -1431,26 +1442,31 @@ class Bot:
             await self._maybe_buy(market, side, ask)
 
     async def user_ws_loop(self) -> None:
-        """Connect to the user-channel WS to track fills on our orders.
-        When a BUY fills, _handle_fill places the corresponding SELL.
-        Auth is the same API creds used for placing orders."""
-        log.info("user_ws_loop: starting")
+        """User-channel WS for instant fill detection. The moment a BUY fills,
+        place SELL @ LIMIT_SELL_PRICE. If both UP and DOWN have shares, merge
+        them to USDC for guaranteed profit (UP+DOWN pair = $1.00)."""
+        log.info("user_ws: starting")
         if not is_live_mode():
-            log.info("user_ws_loop: dry-run mode, skipping fill tracking")
+            log.info("user_ws: dry-run mode, skipping")
             return
         if not isinstance(self.executor, LivePolymarketExecutor):
-            log.info("user_ws_loop: not LivePolymarketExecutor (got %s), skipping",
-                     type(self.executor).__name__)
+            log.info("user_ws: not LivePolymarketExecutor, skipping")
             return
 
+        # Track shares we've already placed sells for (token_id → shares)
+        if not hasattr(self, "shares_sold_for_token"):
+            self.shares_sold_for_token: dict[str, float] = {}
+        # Track shares already merged (slug → shares merged) so we don't double-merge
+        if not hasattr(self, "shares_merged_for_slug"):
+            self.shares_merged_for_slug: dict[str, float] = {}
+
         url = CLOB_WS_URL.replace("/ws/market", "/ws/user")
-        log.info("user_ws_loop: connecting to %s", url)
         backoff = 1.0
         while True:
             try:
-                # Force the executor to derive API creds if it hasn't yet
+                # Force executor to derive creds if not yet
                 if self.executor.client is None:
-                    log.info("user_ws_loop: forcing client init for creds")
+                    log.info("user_ws: forcing executor init for creds")
                     self.executor._ensure_client()
 
                 api_key = getattr(self.executor, "_api_key", None)
@@ -1458,42 +1474,37 @@ class Bot:
                 api_passphrase = getattr(self.executor, "_api_passphrase", None)
 
                 if not (api_key and api_secret and api_passphrase):
-                    log.warning("user_ws_loop: missing creds (key=%s secret=%s pass=%s) — retry 5s",
+                    log.warning("user_ws: missing creds — retry 5s "
+                                "(key=%s secret=%s pass=%s)",
                                 bool(api_key), bool(api_secret), bool(api_passphrase))
                     await asyncio.sleep(5)
                     continue
 
-                # We need at least one condition_id to subscribe
-                conditions = list({m.condition_id for m in self.markets.values()
-                                   if m.condition_id})
-                if not conditions:
-                    log.info("user_ws_loop: no conditions yet, waiting 5s")
-                    await asyncio.sleep(5)
-                    continue
-
-                log.info("user_ws_loop: connecting WS, subscribing to %d conditions",
-                         len(conditions))
+                log.info("user_ws: connecting to %s", url)
                 async with websockets.connect(url, ping_interval=10, ping_timeout=5,
                                               close_timeout=5) as ws:
                     backoff = 1.0
+                    # Per Polymarket docs: omit `markets` to receive ALL events for our key.
+                    # Better than subscribing to specific conditions because new markets
+                    # appear constantly — we'd miss fills on markets we hadn't subscribed to.
                     sub_msg = {
                         "auth": {
                             "apiKey": api_key,
                             "secret": api_secret,
                             "passphrase": api_passphrase,
                         },
-                        "markets": conditions,
                         "type": "user",
                     }
                     await ws.send(json.dumps(sub_msg))
-                    log.info("user_ws_loop: subscribed to %d markets", len(conditions))
-                    debug.event(f"user_ws subscribed to {len(conditions)} markets")
+                    log.info("user_ws: subscribed (all markets)")
+                    debug.event("user_ws subscribed (all markets)")
 
                     async for raw in ws:
                         try:
                             decoded = raw if isinstance(raw, str) else raw.decode("utf-8")
-                            # Log every raw user_ws message so we can see what's coming
-                            debug.ws_msg(f"[user] {decoded[:500]}", kind="in")
+                            if decoded.strip() == "PONG":
+                                continue
+                            debug.ws_msg(f"[user] {decoded[:600]}", kind="in")
                             msg = json.loads(decoded)
                         except Exception as exc:
                             log.warning("user_ws parse error: %s", exc)
@@ -1504,17 +1515,192 @@ class Bot:
                                 continue
                             etype = (m.get("event_type") or m.get("type") or "").lower()
                             log.info("user_ws event: %s", etype or "?")
+                            # MATCHED = trade matched in CLOB. CONFIRMED = on-chain.
+                            # We act on MATCHED for speed (don't wait for chain).
                             if etype == "trade":
-                                await self._handle_fill(m)
+                                status = str(m.get("status", "")).lower()
+                                if status in ("matched", "mined", "confirmed"):
+                                    await self._handle_user_event(m)
                             elif etype == "order":
+                                # Order lifecycle event — could indicate fill
                                 status = str(m.get("status", "")).lower()
                                 if status in ("matched", "filled", "partial_fill"):
-                                    await self._handle_fill(m)
+                                    await self._handle_user_event(m)
             except Exception as exc:
                 log.warning("user_ws error: %s — backoff %.1fs", exc, backoff)
                 debug.event(f"user_ws error: {exc} — backoff {backoff:.1f}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
+
+    async def _handle_user_event(self, ev: dict) -> None:
+        """Called on every user-channel trade/order event. Determines which
+        of our markets/sides this event affects, places SELL on fills, and
+        triggers merge when both UP and DOWN are held."""
+        try:
+            # The event may be a trade or order lifecycle. Either way, find the
+            # token_id of the asset that was matched.
+            token_id = str(ev.get("asset_id") or ev.get("token_id")
+                           or ev.get("maker_asset_id") or ev.get("taker_asset_id") or "")
+            if not token_id or token_id not in self.token_lookup:
+                # Not one of our tracked markets
+                return
+
+            market, side = self.token_lookup[token_id]
+
+            # Determine the side of the fill — only act on BUY fills
+            ev_side = str(ev.get("side", "")).lower()
+            # On user channel, side is from our perspective. BUY fill → we received shares.
+            if ev_side and ev_side != "buy":
+                return  # we don't auto-action on sells/own sells filling
+
+            # Get filled size — try common field names
+            shares_filled = 0.0
+            for key in ("size", "matched_amount", "size_matched", "filled_size",
+                        "maker_amount_filled"):
+                v = ev.get(key)
+                if v is not None:
+                    try:
+                        shares_filled = float(v)
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            if shares_filled < 1.0:
+                # Could be 0 from a partial event we already processed
+                return
+
+            log.info("FILL %s %s: %.4f sh from event", market.slug, side, shares_filled)
+            debug.event(f"FILL ws {market.slug} {side} ({shares_filled:.4f} sh)")
+
+            # 1) Place SELL @ LIMIT_SELL_PRICE for these new shares
+            sold_already = self.shares_sold_for_token.get(token_id, 0.0)
+            self.shares_sold_for_token[token_id] = sold_already + shares_filled
+            try:
+                result = await self.executor.place_limit_sell(
+                    market=market, side=side,
+                    shares=shares_filled, limit_price=LIMIT_SELL_PRICE,
+                )
+                debug.event(f"SELL placed {market.slug} {side} @ {LIMIT_SELL_PRICE} "
+                            f"({shares_filled:.4f} sh, id={result.get('order_id')})")
+            except ExecutionError as exc:
+                debug.event(f"SELL failed {market.slug} {side}: {exc}")
+                self.shares_sold_for_token[token_id] = sold_already  # rollback
+            except Exception as exc:
+                log.exception("sell placement error: %s", exc)
+                self.shares_sold_for_token[token_id] = sold_already
+
+            # 2) MERGE: if we now hold BOTH UP and DOWN shares for this slug,
+            #    convert pairs to USDC for risk-free profit.
+            await self._maybe_merge_pair(market)
+        except Exception as exc:
+            log.exception("user event handler error: %s", exc)
+
+    async def _maybe_merge_pair(self, market: "CryptoMarket") -> None:
+        """If we hold both UP and DOWN shares for a market, merge the
+        overlapping pairs back to USDC (each pair = $1.00). Only the
+        minimum of the two sides can be merged."""
+        try:
+            up_bal = await self._get_token_balance(market.up_token_id)
+            down_bal = await self._get_token_balance(market.down_token_id)
+            pair_count = min(up_bal, down_bal)
+            already_merged = self.shares_merged_for_slug.get(market.slug, 0.0)
+            net_to_merge = pair_count - already_merged
+            if net_to_merge < 5.0:  # Polymarket min unit
+                return
+
+            log.info("MERGE %s: UP=%.4f DOWN=%.4f → merging %.4f pairs",
+                     market.slug, up_bal, down_bal, net_to_merge)
+            debug.event(f"MERGE {market.slug} {net_to_merge:.4f} pairs (UP+DOWN → USDC)")
+            self.shares_merged_for_slug[market.slug] = already_merged + net_to_merge
+            try:
+                result = await self._merge_positions(market, net_to_merge)
+                debug.event(f"MERGE done {market.slug}: {result}")
+            except Exception as exc:
+                log.exception("merge failed %s: %s", market.slug, exc)
+                debug.event(f"MERGE failed {market.slug}: {exc}")
+                self.shares_merged_for_slug[market.slug] = already_merged
+        except Exception as exc:
+            log.exception("merge check error: %s", exc)
+
+    async def _merge_positions(self, market: "CryptoMarket", shares: float) -> dict:
+        """Call Polymarket's merge to convert UP+DOWN pairs back to USDC."""
+        loop = asyncio.get_running_loop()
+        if not hasattr(self.executor, "_executor_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+            self.executor._executor_pool = ThreadPoolExecutor(
+                max_workers=16, thread_name_prefix="poly-buy")
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                self.executor._executor_pool, self._merge_positions_sync, market, shares),
+            timeout=15.0,
+        )
+
+    def _merge_positions_sync(self, market: "CryptoMarket", shares: float) -> dict:
+        """Synchronously execute the merge. The V2 SDK exposes this differently
+        depending on version — try a few likely method names."""
+        client = self.executor.client
+        condition_id = market.condition_id
+        # Polymarket uses 6-decimal scaling for amounts in some methods
+        amount_raw = int(shares * 1_000_000)
+
+        # Try several method signatures the V2 SDK might use
+        attempts = [
+            ("merge_positions", {"condition_id": condition_id,
+                                 "amount": shares,
+                                 "neg_risk": bool(market.neg_risk)}),
+            ("merge",          {"condition_id": condition_id,
+                                 "amount": shares}),
+            ("merge_positions",{"condition_id": condition_id, "amount": amount_raw}),
+        ]
+        last_exc = None
+        for method_name, kwargs in attempts:
+            if not hasattr(client, method_name):
+                continue
+            try:
+                method = getattr(client, method_name)
+                return {"method": method_name, "result": method(**kwargs)}
+            except TypeError as exc:
+                last_exc = exc
+                continue
+            except Exception as exc:
+                last_exc = exc
+                # If the method exists but errors, no point trying others
+                raise
+
+        # Fallback: direct on-chain call to ConditionalTokens contract
+        log.warning("no SDK merge method found; merge may need manual on-chain call")
+        if last_exc:
+            raise last_exc
+        raise ExecutionError("merge: no compatible SDK method found")
+
+    async def _get_token_balance(self, token_id: str) -> float:
+        """Return shares owned for a given token_id."""
+        loop = asyncio.get_running_loop()
+        if not hasattr(self.executor, "_executor_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+            self.executor._executor_pool = ThreadPoolExecutor(
+                max_workers=16, thread_name_prefix="poly-buy")
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                self.executor._executor_pool, self._get_token_balance_sync, token_id),
+            timeout=10.0,
+        )
+
+    def _get_token_balance_sync(self, token_id: str) -> float:
+        try:
+            from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+        except Exception:
+            return 0.0
+        try:
+            res = self.executor.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+            )
+            raw = res.get("balance") if isinstance(res, dict) else None
+            if raw is None:
+                return 0.0
+            return float(raw) / 1_000_000
+        except Exception as exc:
+            log.warning("balance query failed: %s", exc)
+            return 0.0
 
     async def resolution_loop(self) -> None:
         while True:
